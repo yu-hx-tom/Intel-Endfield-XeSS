@@ -1,0 +1,6 @@
+SR_NATIVE_PASS(reactive,Reactive)
+SR_NATIVE_PASS(transparency,Transparency)
+SR_NATIVE_PASS(pyramid,Pyramid)
+SR_NATIVE_PASS(shading_change,ShadingChange)
+SR_NATIVE_PASS(reactivity,PrepareReactivity)
+SR_NATIVE_PASS(instability,LumaInstability)

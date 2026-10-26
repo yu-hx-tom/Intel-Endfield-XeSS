@@ -1,0 +1,5 @@
+#define fsr_observer_entry sr_transparency_observer_entry
+#define fsr_observer_entry_end sr_transparency_observer_entry_end
+#define fsr_original_trampoline sr_transparency_original_trampoline
+#define fsr_observe_before sr_transparency_observe_before
+#include "fsr_detour_entry.S"

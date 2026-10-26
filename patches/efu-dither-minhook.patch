@@ -1,0 +1,434 @@
+--- a/src/dll.zig
++++ b/src/dll.zig
+@@ -1,5 +1,7 @@
+ // Runtime patch DLL
+ const std = @import("std");
++const builtin = @import("builtin");
++const diagnostic = @import("runtime_diagnostics.zig");
+ const windows = std.os.windows;
+ 
+ const HMODULE = windows.HMODULE;
+@@ -26,6 +28,11 @@
+ const launch_check_failure: c_int = 10100;
+ const launch_status_prefix = "\"msg\":{\"code\":";
+ const launch_error = "\"errorCode\":10100,";
++
++// Private, statically linked MinHook instance. Only CameraPitch uses it.
++extern fn MH_Initialize() callconv(.winapi) c_int;
++extern fn MH_CreateHook(?*anyopaque, ?*anyopaque, *?*anyopaque) callconv(.winapi) c_int;
++extern fn MH_EnableHook(?*anyopaque) callconv(.winapi) c_int;
+ 
+ // Win32 and IL2CPP surface
+ extern "kernel32" fn GetModuleHandleA(lpModuleName: ?[*:0]const u8) callconv(.winapi) ?HMODULE;
+@@ -52,6 +59,9 @@
+ extern "user32" fn GetWindowThreadProcessId(hwnd: HWND, lpdw_process_id: ?*DWORD) callconv(.winapi) DWORD;
+ extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
+ 
++const Il2CppThreadCurrentFn = *const fn () callconv(.c) ?*anyopaque;
++const Il2CppThreadAttachFn = *const fn (?*anyopaque) callconv(.c) ?*anyopaque;
++const Il2CppThreadDetachFn = *const fn (?*anyopaque) callconv(.c) void;
+ const Il2CppDomainGetFn = *const fn () callconv(.c) ?*anyopaque;
+ const Il2CppDomainAssemblyOpenFn = *const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque;
+ const Il2CppAssemblyGetImageFn = *const fn (?*anyopaque) callconv(.c) ?*anyopaque;
+@@ -78,8 +88,19 @@
+ };
+ 
+ var g_enabled = true;
+-var g_force_clear_method: ?*Il2CppMethodInfo = null;
+-var g_pitch_hook = Hook{};
++var g_force_clear_info: usize = 0;
++var g_force_clear_address: usize = 0;
++var g_pitch_original_address: usize = 0;
++var g_entered: u64 = 0;
++var g_enabled_seen: u64 = 0;
++var g_clear_called: u64 = 0;
++var g_clear_returned: u64 = 0;
++var g_toggle_count: u64 = 0;
++var g_owned_runtime_thread: ?*anyopaque = null;
++var g_owned_runtime_detach: ?Il2CppThreadDetachFn = null;
++var g_resolution_terminal = false;
++var g_module_settled = false;
++var g_resolution_stage: []const u8 = "not_started";
+ var g_launch_hook = Hook{};
+ var g_launch_result: ?LaunchResultFn = null;
+ 
+@@ -136,11 +157,11 @@
+     return 0;
+ }
+ 
+-fn patchDirectLaunchCheck() void {
+-    const one_channel = LoadLibraryA("OneChannelLC.dll") orelse return;
+-    const check = GetProcAddress(one_channel, @ptrFromInt(1)) orelse return;
+-    g_launch_result = @ptrCast(GetProcAddress(one_channel, @ptrFromInt(2)) orelse return);
+-    _ = installJumpHook(&g_launch_hook, @ptrCast(check), @intFromPtr(&launchCheckHook));
++fn patchDirectLaunchCheck() bool {
++    const one_channel = LoadLibraryA("OneChannelLC.dll") orelse return false;
++    const check = GetProcAddress(one_channel, @ptrFromInt(1)) orelse return false;
++    g_launch_result = @ptrCast(GetProcAddress(one_channel, @ptrFromInt(2)) orelse return false);
++    return installJumpHook(&g_launch_hook, @ptrCast(check), @intFromPtr(&launchCheckHook));
+ }
+ 
+ // x64 instruction decoding
+@@ -293,54 +314,167 @@
+ }
+ 
+ // Patch target resolution and runtime toggle
++fn resolutionStage(stage: []const u8) void {
++    if (!std.mem.eql(u8, g_resolution_stage, stage)) {
++        g_resolution_stage = stage;
++        diagnostic.event("resolve_stage", stage, 0);
++    }
++}
++fn missingExport(name: []const u8) ?*anyopaque {
++    g_resolution_terminal = true;
++    diagnostic.event("missing_export", name, 0);
++    return null;
++}
++fn pending(stage: []const u8) ?PatchTargets {
++    resolutionStage(stage);
++    return null;
++}
++fn runtimeModule() ?HMODULE {
++    if (builtin.is_test) return @ptrFromInt(1);
++    return GetModuleHandleA("GameAssembly.dll");
++}
++fn runtimeExport(module: HMODULE, name: [*:0]const u8) ?*anyopaque {
++    if (builtin.is_test) return mockRuntimeExport(name);
++    return GetProcAddress(module, name);
++}
++fn attachWorkerThread(module: HMODULE, domain: *anyopaque) bool {
++    const current: Il2CppThreadCurrentFn = @ptrCast(runtimeExport(module, "il2cpp_thread_current") orelse missingExport("il2cpp_thread_current") orelse return false);
++    const attach: Il2CppThreadAttachFn = @ptrCast(runtimeExport(module, "il2cpp_thread_attach") orelse missingExport("il2cpp_thread_attach") orelse return false);
++    const detach: Il2CppThreadDetachFn = @ptrCast(runtimeExport(module, "il2cpp_thread_detach") orelse missingExport("il2cpp_thread_detach") orelse return false);
++    if (current() != null) return true;
++    diagnostic.event("worker_attach_enter", "before_metadata_queries", 0);
++    const thread = attach(domain) orelse {
++        diagnostic.event("worker_attach_failed", "no_metadata_queries_performed", 0);
++        g_resolution_terminal = true;
++        return false;
++    };
++    g_owned_runtime_thread = thread;
++    g_owned_runtime_detach = detach;
++    diagnostic.event("worker_attach_returned", "owned_worker_only", 1);
++    return true;
++}
++fn detachWorkerThread() void {
++    const thread = g_owned_runtime_thread orelse return;
++    const detach = g_owned_runtime_detach orelse return;
++    g_owned_runtime_thread = null;
++    g_owned_runtime_detach = null;
++    detach(thread);
++    diagnostic.event("worker_detached", "owned_worker_only", 1);
++}
+ fn resolvePatchTargets() ?PatchTargets {
+-    const game_assembly = waitForModule("GameAssembly.dll");
+-
+-    const domain_get: Il2CppDomainGetFn = @ptrCast(GetProcAddress(game_assembly, "il2cpp_domain_get") orelse return null);
+-    const assembly_open: Il2CppDomainAssemblyOpenFn = @ptrCast(GetProcAddress(game_assembly, "il2cpp_domain_assembly_open") orelse return null);
+-    const assembly_get_image: Il2CppAssemblyGetImageFn = @ptrCast(GetProcAddress(game_assembly, "il2cpp_assembly_get_image") orelse return null);
+-    const class_from_name: Il2CppClassFromNameFn = @ptrCast(GetProcAddress(game_assembly, "il2cpp_class_from_name") orelse return null);
+-    const method_from_name: Il2CppClassGetMethodFromNameFn = @ptrCast(GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name") orelse return null);
+-
+-    const domain = domain_get() orelse return null;
+-    const assembly = assembly_open(domain, "Gameplay.Beyond.dll") orelse return null;
+-    const image = assembly_get_image(assembly) orelse return null;
+-    const camera_class = class_from_name(image, "Beyond.Gameplay.View", "CameraMono") orelse return null;
+-    const process_pitch = method_from_name(camera_class, "_ProcessDitherByPitch", 0) orelse return null;
+-    const force_clear = method_from_name(camera_class, "ForceClearDither", 0) orelse return null;
+-
+-    if (process_pitch.address == 0 or force_clear.address == 0) return null;
++    const game_assembly = runtimeModule() orelse return pending("module_not_ready");
++    if (!g_module_settled) {
++        diagnostic.event("module_settle", "upstream_delay_ms", 2000);
++        if (!builtin.is_test) Sleep(2000);
++        g_module_settled = true;
++    }
++    const domain_get: Il2CppDomainGetFn = @ptrCast(runtimeExport(game_assembly, "il2cpp_domain_get") orelse missingExport("il2cpp_domain_get") orelse return null);
++    const assembly_open: Il2CppDomainAssemblyOpenFn = @ptrCast(runtimeExport(game_assembly, "il2cpp_domain_assembly_open") orelse missingExport("il2cpp_domain_assembly_open") orelse return null);
++    const assembly_get_image: Il2CppAssemblyGetImageFn = @ptrCast(runtimeExport(game_assembly, "il2cpp_assembly_get_image") orelse missingExport("il2cpp_assembly_get_image") orelse return null);
++    const class_from_name: Il2CppClassFromNameFn = @ptrCast(runtimeExport(game_assembly, "il2cpp_class_from_name") orelse missingExport("il2cpp_class_from_name") orelse return null);
++    const method_from_name: Il2CppClassGetMethodFromNameFn = @ptrCast(runtimeExport(game_assembly, "il2cpp_class_get_method_from_name") orelse missingExport("il2cpp_class_get_method_from_name") orelse return null);
++    const domain = domain_get() orelse return pending("domain_not_ready");
++    // This worker originates in CreateThread, outside IL2CPP's GC thread set.
++    if (!attachWorkerThread(game_assembly, domain)) return null;
++    const assembly = assembly_open(domain, "Gameplay.Beyond.dll") orelse return pending("assembly_not_ready");
++    const image = assembly_get_image(assembly) orelse return pending("image_not_ready");
++    const camera_class = class_from_name(image, "Beyond.Gameplay.View", "CameraMono") orelse return pending("class_not_ready");
++    const process_pitch = method_from_name(camera_class, "_ProcessDitherByPitch", 0) orelse return pending("pitch_method_not_ready");
++    const force_clear = method_from_name(camera_class, "ForceClearDither", 0) orelse return pending("clear_method_not_ready");
++    if (process_pitch.address == 0 or force_clear.address == 0) return pending("method_pointer_not_ready");
++    diagnostic.target(@intFromPtr(game_assembly), process_pitch.address);
++    diagnostic.event("force_clear_target", "module_relative_rva", @intCast(force_clear.address - @intFromPtr(game_assembly)));
+     return .{ .process_pitch = process_pitch, .force_clear = force_clear };
+ }
+ 
++fn installPitchHook(targets: PatchTargets) bool {
++    var status = MH_Initialize();
++    diagnostic.event("minhook_initialize", "private_instance", status);
++    if (status != 0) return false;
++    var original: ?*anyopaque = null;
++    const target: *anyopaque = @ptrFromInt(targets.process_pitch.address);
++    status = MH_CreateHook(target, @ptrFromInt(@intFromPtr(&cameraPitchHook)), &original);
++    diagnostic.event("minhook_create", "camera_pitch_only", status);
++    if (status != 0 or original == null) return false;
++    // Publish immutable targets before enabling the detour. Original receives
++    // the incoming MethodInfo; ForceClear receives its own resolved MethodInfo.
++    @atomicStore(usize, &g_force_clear_info, @intFromPtr(targets.force_clear), .release);
++    @atomicStore(usize, &g_force_clear_address, targets.force_clear.address, .release);
++    @atomicStore(usize, &g_pitch_original_address, @intFromPtr(original.?), .release);
++    status = MH_EnableHook(target);
++    diagnostic.event("pitch_hook_result", "minhook_enable_camera_pitch_only", status);
++    // Even a failed Enable can involve concurrent threads. Keep our owned
++    // MinHook storage and trampoline pinned until process exit; never repatch.
++    return status == 0;
++}
++
+ fn cameraPitchHook(instance: ?*anyopaque, method_info: ?*Il2CppMethodInfo) callconv(.c) void {
+-    const trampoline = g_pitch_hook.trampoline orelse return;
+-    const original: InstanceVoidMethod = @ptrCast(trampoline);
++    _ = @atomicRmw(u64, &g_entered, .Add, 1, .monotonic);
++    const original_address = @atomicLoad(usize, &g_pitch_original_address, .acquire);
++    if (original_address == 0) return;
++    const original: InstanceVoidMethod = @ptrFromInt(original_address);
+     original(instance, method_info);
+-
+     if (!@atomicLoad(bool, &g_enabled, .acquire)) return;
+-    const method = g_force_clear_method orelse return;
+-    const force_clear: InstanceVoidMethod = @ptrFromInt(method.address);
+-    force_clear(instance, method);
++    _ = @atomicRmw(u64, &g_enabled_seen, .Add, 1, .monotonic);
++    const clear_address = @atomicLoad(usize, &g_force_clear_address, .acquire);
++    const clear_info = @atomicLoad(usize, &g_force_clear_info, .acquire);
++    if (clear_address == 0 or clear_info == 0) return;
++    const force_clear: InstanceVoidMethod = @ptrFromInt(clear_address);
++    _ = @atomicRmw(u64, &g_clear_called, .Add, 1, .monotonic);
++    force_clear(instance, @ptrFromInt(clear_info));
++    _ = @atomicRmw(u64, &g_clear_returned, .Add, 1, .monotonic);
+ }
+ 
+ fn patchThread(_: ?*anyopaque) callconv(.winapi) DWORD {
+-    patchDirectLaunchCheck();
+-    const targets = resolvePatchTargets() orelse return 0;
+-    g_force_clear_method = targets.force_clear;
+-    if (!installJumpHook(&g_pitch_hook, @ptrFromInt(targets.process_pitch.address), @intFromPtr(&cameraPitchHook))) return 0;
+-
++    const launch_installed = patchDirectLaunchCheck();
++    diagnostic.init();
++    defer diagnostic.close();
++    defer detachWorkerThread();
++    diagnostic.event("worker_started", "default_enabled", 1);
++    diagnostic.event("launch_hook_result", "upstream_engine_unchanged", @intFromBool(launch_installed));
++    const deadline = diagnostic.now() + 60_000;
++    var targets: ?PatchTargets = null;
++    while (diagnostic.now() < deadline) {
++        targets = resolvePatchTargets();
++        if (targets != null) break;
++        if (g_resolution_terminal) return 0;
++        Sleep(200);
++    }
++    const ready = targets orelse {
++        diagnostic.event("resolve_timeout", g_resolution_stage, 60_000);
++        return 0;
++    };
++    detachWorkerThread();
++    if (!installPitchHook(ready)) return 0;
++    diagnostic.event("hotkey_loop_started", "default_enabled", 1);
+     var was_combo_down = altDown() and keyDown(VK_F12);
++    var last_snapshot = diagnostic.now();
++    var last_entered: u64 = 0;
++    var last_clear_returned: u64 = 0;
++    var last_toggles: u64 = 0;
+     while (true) {
+         Sleep(POLL);
+         const combo_down = altDown() and keyDown(VK_F12);
+         if (hotkeyWindowActive() and combo_down and !was_combo_down) {
+             const enabled = @atomicLoad(bool, &g_enabled, .acquire);
+             @atomicStore(bool, &g_enabled, !enabled, .release);
++            _ = @atomicRmw(u64, &g_toggle_count, .Add, 1, .monotonic);
++            diagnostic.event("enabled_changed", "alt_f12", @intFromBool(!enabled));
+         }
+         was_combo_down = combo_down;
+-    }
+-
++        if (diagnostic.now() - last_snapshot >= 1000) {
++            last_snapshot = diagnostic.now();
++            const entered = @atomicLoad(u64, &g_entered, .monotonic);
++            const toggles = @atomicLoad(u64, &g_toggle_count, .monotonic);
++            const clear_returned = @atomicLoad(u64, &g_clear_returned, .monotonic);
++            if ((last_entered == 0 and entered > 0) or (last_clear_returned == 0 and clear_returned > 0) or toggles != last_toggles) {
++                diagnostic.counters(entered, @atomicLoad(u64, &g_enabled_seen, .monotonic), @atomicLoad(u64, &g_clear_called, .monotonic), clear_returned, toggles, @atomicLoad(bool, &g_enabled, .acquire));
++                last_entered = entered;
++                last_clear_returned = clear_returned;
++                last_toggles = toggles;
++            }
++        }
++    }
+     return 0;
+ }
+ 
+@@ -354,3 +488,148 @@
+     }
+     return winBool(true);
+ }
++
++// Pure CPU regression for the exact current prologue; no game image is loaded.
++test "legacy twelve-byte decoder rejects the current nine-byte-prefix RIP load" {
++    var prefix = [_]u8{0x40,0x53,0x48,0x81,0xec,0x90,0,0,0,0x48,0x8b,0x05,0x70,0x98,0x10,0x0c,0x48,0x8b,0xd9,0x48,0x8b,0x48,0x40,0x48,0x85,0xc9,0x0f,0x85,0x56,0xf2,0xcf,0x01};
++    try std.testing.expectEqual(@as(?usize,2), instructionLen(&prefix,0));
++    try std.testing.expectEqual(@as(?usize,7), instructionLen(&prefix,2));
++    try std.testing.expectEqual(@as(?usize,null), instructionLen(&prefix,9));
++    try std.testing.expectEqual(@as(?usize,null), patchLen(&prefix[0]));
++}
++var test_original_calls: usize = 0;
++var test_clear_calls: usize = 0;
++var test_seen_method: ?*Il2CppMethodInfo = null;
++fn testOriginal(_: ?*anyopaque, method: ?*Il2CppMethodInfo) callconv(.c) void { test_original_calls += 1; test_seen_method = method; }
++fn testClear(_: ?*anyopaque, method: ?*Il2CppMethodInfo) callconv(.c) void { test_clear_calls += 1; test_seen_method = method; }
++test "actual callback preserves original once and clears only when enabled" {
++    var incoming = Il2CppMethodInfo{.address=1};
++    var clear_info = Il2CppMethodInfo{.address=@intFromPtr(&testClear)};
++    @atomicStore(usize,&g_pitch_original_address,@intFromPtr(&testOriginal),.release);
++    @atomicStore(usize,&g_force_clear_address,@intFromPtr(&testClear),.release);
++    @atomicStore(usize,&g_force_clear_info,@intFromPtr(&clear_info),.release);
++    @atomicStore(bool,&g_enabled,true,.release);
++    cameraPitchHook(null,&incoming);
++    try std.testing.expectEqual(@as(usize,1),test_original_calls);
++    try std.testing.expectEqual(@as(usize,1),test_clear_calls);
++    try std.testing.expect(test_seen_method==&clear_info);
++    @atomicStore(bool,&g_enabled,false,.release);
++    cameraPitchHook(null,&incoming);
++    try std.testing.expectEqual(@as(usize,2),test_original_calls);
++    try std.testing.expectEqual(@as(usize,1),test_clear_calls);
++    try std.testing.expect(test_seen_method==&incoming);
++    try std.testing.expectEqual(@as(u64,2),@atomicLoad(u64,&g_entered,.monotonic));
++    try std.testing.expectEqual(@as(u64,1),@atomicLoad(u64,&g_clear_called,.monotonic));
++    try std.testing.expectEqual(@as(u64,1),@atomicLoad(u64,&g_clear_returned,.monotonic));
++}
++
++// The actual resolver uses only this export provider in Zig's owned test EXE.
++var mock_domain_ready = true;
++var mock_assembly_ready = true;
++var mock_attached = false;
++var mock_attach_allowed = true;
++var mock_missing_thread_export = false;
++var mock_attach_calls: usize = 0;
++var mock_detach_calls: usize = 0;
++var mock_sensitive_calls: usize = 0;
++var mock_unregistered_query = false;
++var mock_pitch_method = Il2CppMethodInfo{.address=0};
++var mock_clear_method = Il2CppMethodInfo{.address=0};
++fn resetRuntimeMock() void {
++    mock_domain_ready=true; mock_assembly_ready=true; mock_attached=false;
++    mock_attach_allowed=true; mock_missing_thread_export=false;
++    mock_attach_calls=0; mock_detach_calls=0; mock_sensitive_calls=0; mock_unregistered_query=false;
++    g_owned_runtime_thread=null; g_owned_runtime_detach=null;
++    g_resolution_terminal=false; g_resolution_stage="not_started"; g_module_settled=false;
++    mock_pitch_method.address=@intFromPtr(&testOriginal);
++    mock_clear_method.address=@intFromPtr(&testClear);
++}
++fn mockDomain() callconv(.c) ?*anyopaque { return if(mock_domain_ready) @ptrFromInt(1) else null; }
++fn mockCurrent() callconv(.c) ?*anyopaque { return if(mock_attached) @ptrFromInt(2) else null; }
++fn mockAttach(_: ?*anyopaque) callconv(.c) ?*anyopaque {
++    mock_attach_calls+=1;
++    if(!mock_attach_allowed) return null;
++    mock_attached=true;
++    return @ptrFromInt(2);
++}
++fn mockDetach(_: ?*anyopaque) callconv(.c) void { mock_detach_calls+=1; mock_attached=false; }
++fn mockSensitive() void { mock_sensitive_calls+=1; if(!mock_attached) mock_unregistered_query=true; }
++fn mockAssembly(_: ?*anyopaque, _: [*:0]const u8) callconv(.c) ?*anyopaque {
++    mockSensitive(); return if(mock_assembly_ready) @ptrFromInt(3) else null;
++}
++fn mockImage(_: ?*anyopaque) callconv(.c) ?*anyopaque { mockSensitive(); return @ptrFromInt(4); }
++fn mockClass(_: ?*anyopaque, _: [*:0]const u8, _: [*:0]const u8) callconv(.c) ?*anyopaque { mockSensitive(); return @ptrFromInt(5); }
++fn mockMethod(_: ?*anyopaque, name: [*:0]const u8, _: c_int) callconv(.c) ?*Il2CppMethodInfo {
++    mockSensitive();
++    return if(std.mem.eql(u8,std.mem.span(name),"_ProcessDitherByPitch")) &mock_pitch_method else &mock_clear_method;
++}
++fn mockRuntimeExport(name: [*:0]const u8) ?*anyopaque {
++    const text=std.mem.span(name);
++    if(std.mem.eql(u8,text,"il2cpp_domain_get")) return @ptrFromInt(@intFromPtr(&mockDomain));
++    if(mock_missing_thread_export and std.mem.eql(u8,text,"il2cpp_thread_attach")) return null;
++    if(std.mem.eql(u8,text,"il2cpp_thread_current")) return @ptrFromInt(@intFromPtr(&mockCurrent));
++    if(std.mem.eql(u8,text,"il2cpp_thread_attach")) return @ptrFromInt(@intFromPtr(&mockAttach));
++    if(std.mem.eql(u8,text,"il2cpp_thread_detach")) return @ptrFromInt(@intFromPtr(&mockDetach));
++    if(std.mem.eql(u8,text,"il2cpp_domain_assembly_open")) return @ptrFromInt(@intFromPtr(&mockAssembly));
++    if(std.mem.eql(u8,text,"il2cpp_assembly_get_image")) return @ptrFromInt(@intFromPtr(&mockImage));
++    if(std.mem.eql(u8,text,"il2cpp_class_from_name")) return @ptrFromInt(@intFromPtr(&mockClass));
++    if(std.mem.eql(u8,text,"il2cpp_class_get_method_from_name")) return @ptrFromInt(@intFromPtr(&mockMethod));
++    return null;
++}
++test "actual resolver waits for domain before attachment and metadata queries" {
++    resetRuntimeMock(); mock_domain_ready=false;
++    try std.testing.expect(resolvePatchTargets()==null);
++    try std.testing.expectEqual(@as(usize,0),mock_attach_calls);
++    try std.testing.expectEqual(@as(usize,0),mock_sensitive_calls);
++    mock_domain_ready=true;
++    try std.testing.expect(resolvePatchTargets()!=null);
++    try std.testing.expectEqual(@as(usize,1),mock_attach_calls);
++    try std.testing.expectEqual(@as(usize,5),mock_sensitive_calls);
++    try std.testing.expect(!mock_unregistered_query);
++    detachWorkerThread();
++    try std.testing.expectEqual(@as(usize,1),mock_detach_calls);
++}
++test "actual resolver retains one owned attachment across a metadata retry" {
++    resetRuntimeMock(); mock_assembly_ready=false;
++    try std.testing.expect(resolvePatchTargets()==null);
++    try std.testing.expect(mock_attached);
++    mock_assembly_ready=true;
++    try std.testing.expect(resolvePatchTargets()!=null);
++    try std.testing.expectEqual(@as(usize,1),mock_attach_calls);
++    try std.testing.expect(!mock_unregistered_query);
++    detachWorkerThread(); detachWorkerThread();
++    try std.testing.expectEqual(@as(usize,1),mock_detach_calls);
++}
++test "failed attach and missing thread export never reach metadata queries" {
++    resetRuntimeMock(); mock_attach_allowed=false;
++    try std.testing.expect(resolvePatchTargets()==null);
++    try std.testing.expect(g_resolution_terminal);
++    try std.testing.expectEqual(@as(usize,0),mock_sensitive_calls);
++    detachWorkerThread();
++    try std.testing.expectEqual(@as(usize,0),mock_detach_calls);
++    resetRuntimeMock(); mock_missing_thread_export=true;
++    try std.testing.expect(resolvePatchTargets()==null);
++    try std.testing.expect(g_resolution_terminal);
++    try std.testing.expectEqual(@as(usize,0),mock_attach_calls);
++    try std.testing.expectEqual(@as(usize,0),mock_sensitive_calls);
++}
++test "existing registration is not detached by the worker" {
++    resetRuntimeMock(); mock_attached=true;
++    try std.testing.expect(resolvePatchTargets()!=null);
++    try std.testing.expect(!mock_unregistered_query);
++    try std.testing.expectEqual(@as(usize,0),mock_attach_calls);
++    detachWorkerThread();
++    try std.testing.expectEqual(@as(usize,0),mock_detach_calls);
++}
++test "failed metadata resolution cleans up the owned worker attachment" {
++    resetRuntimeMock(); mock_assembly_ready=false;
++    {
++        defer detachWorkerThread();
++        try std.testing.expect(resolvePatchTargets()==null);
++        try std.testing.expect(mock_attached);
++    }
++    try std.testing.expectEqual(@as(usize,1),mock_attach_calls);
++    try std.testing.expectEqual(@as(usize,1),mock_detach_calls);
++    try std.testing.expect(!mock_attached);
++    try std.testing.expect(!mock_unregistered_query);
++}
+--- a/build.zig
++++ b/build.zig
+@@ -382,6 +382,14 @@
+         }),
+     });
+ 
++    // Private pinned MinHook supports current CameraPitch's short prologue.
++    dll.root_module.link_libc = true;
++    dll.root_module.addIncludePath(b.path("vendor/minhook/include"));
++    dll.root_module.addCSourceFiles(.{
++        .files = &.{"vendor/minhook/src/buffer.c", "vendor/minhook/src/hook.c", "vendor/minhook/src/trampoline.c", "vendor/minhook/src/hde/hde64.c"},
++        .flags = &.{"-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX"},
++    });
++
+     if (dll_only) {
+         const dll_rc = addGeneratedVersionResource(
+             b,

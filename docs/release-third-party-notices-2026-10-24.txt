@@ -1,0 +1,29 @@
+Third-party notices for Endfield XeSS minimal release
+
+Intel XeSS SDK 3.0.2
+The unmodified libxess.dll, libxess_fg.dll and libxell.dll are redistributed
+with the Intel Simplified Software License in mod/LICENSE.txt and the SDK
+third-party-programs notice in licenses/Intel-third-party-programs.txt.
+
+Endfield-Uncensored (EFU)
+Locally modified, separately executed program. See mod/EFU-SOURCE-NOTICE.txt,
+mod/EFU-LICENSE.txt, and efu-corresponding-source/. That complete corresponding
+source includes local changes and the licenses for embedded fonts.
+
+MinHook / HDE
+See MINHOOK-LICENSE.txt. The observer and the separately built EFU use MinHook.
+
+Vulkan-Headers
+See licenses/Vulkan-Headers-LICENSE.md and the accompanying Apache-2.0/MIT
+texts. Header source is identified by dependencies.lock.json in the source
+review archive.
+
+NVIDIA Streamline header declarations
+See licenses/Streamline-license.txt. No NVIDIA Streamline DLL is included.
+
+LLVM-MinGW compiler runtime
+Statically linked runtime notices are retained in licenses/LLVM-MinGW-LICENSE.TXT.
+
+These components retain their respective licenses and copyrights. Their names
+do not imply endorsement of this project. No game executable, game asset,
+official launcher binary, driver, or RTSS binary is included.

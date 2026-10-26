@@ -1,0 +1,5 @@
+#define fsr_observer_entry sr_rcas_observer_entry
+#define fsr_observer_entry_end sr_rcas_observer_entry_end
+#define fsr_original_trampoline sr_rcas_original_trampoline
+#define fsr_observe_before sr_rcas_observe_before
+#include "fsr_detour_entry.S"

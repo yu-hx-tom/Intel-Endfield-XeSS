@@ -1,0 +1,5 @@
+#define fsr_observer_entry sr_reactive_observer_entry
+#define fsr_observer_entry_end sr_reactive_observer_entry_end
+#define fsr_original_trampoline sr_reactive_original_trampoline
+#define fsr_observe_before sr_reactive_observe_before
+#include "fsr_detour_entry.S"

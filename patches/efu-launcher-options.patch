@@ -1,0 +1,51 @@
+--- a/src/dll.zig
++++ b/src/dll.zig
+@@ -41,6 +41,7 @@
+ extern "kernel32" fn Sleep(dwMilliseconds: DWORD) callconv(.winapi) void;
+ extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+ extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
++extern "kernel32" fn GetEnvironmentVariableW([*:0]const u16, [*]u16, u32) callconv(.winapi) u32;
+ extern "kernel32" fn FlushInstructionCache(hProcess: HANDLE, lpBaseAddress: ?*const anyopaque, dwSize: SIZE_T) callconv(.winapi) BOOL;
+ extern "kernel32" fn VirtualAlloc(lpAddress: ?LPVOID, dwSize: SIZE_T, flAllocationType: DWORD, flProtect: DWORD) callconv(.winapi) ?LPVOID;
+ extern "kernel32" fn VirtualProtect(lpAddress: LPVOID, dwSize: SIZE_T, flNewProtect: DWORD, lpflOldProtect: *DWORD) callconv(.winapi) BOOL;
+@@ -425,12 +426,19 @@
+     _ = @atomicRmw(u64, &g_clear_returned, .Add, 1, .monotonic);
+ }
+ 
++fn noDitherDefault(value: []const u16) bool {
++    return !(value.len == 1 and value[0] == '0');
++}
+ fn patchThread(_: ?*anyopaque) callconv(.winapi) DWORD {
++    var option: [2]u16 = .{0, 0};
++    const option_length = GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("EFU_NO_DITHER"), &option, option.len);
++    const initially_enabled = noDitherDefault(option[0..@min(option_length, option.len)]);
++    @atomicStore(bool, &g_enabled, initially_enabled, .release);
+     const launch_installed = patchDirectLaunchCheck();
+     diagnostic.init();
+     defer diagnostic.close();
+     defer detachWorkerThread();
+-    diagnostic.event("worker_started", "default_enabled", 1);
++    diagnostic.event("worker_started", "default_enabled", @intFromBool(initially_enabled));
+     diagnostic.event("launch_hook_result", "upstream_engine_unchanged", @intFromBool(launch_installed));
+     const deadline = diagnostic.now() + 60_000;
+     var targets: ?PatchTargets = null;
+@@ -446,7 +454,7 @@
+     };
+     detachWorkerThread();
+     if (!installPitchHook(ready)) return 0;
+-    diagnostic.event("hotkey_loop_started", "default_enabled", 1);
++    diagnostic.event("hotkey_loop_started", "default_enabled", @intFromBool(initially_enabled));
+     var was_combo_down = altDown() and keyDown(VK_F12);
+     var last_snapshot = diagnostic.now();
+     var last_entered: u64 = 0;
+@@ -633,3 +641,10 @@
+     try std.testing.expect(!mock_attached);
+     try std.testing.expect(!mock_unregistered_query);
+ }
++
++test "launcher chooses no-dither default without changing the runtime toggle" {
++    try std.testing.expect(!noDitherDefault(&.{'0'}));
++    try std.testing.expect(noDitherDefault(&.{'1'}));
++    try std.testing.expect(noDitherDefault(&.{}));
++    try std.testing.expect(noDitherDefault(&.{'x'}));
++}

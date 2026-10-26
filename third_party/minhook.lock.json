@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/TsudaKageyu/minhook",
+  "release": "v1.3.4",
+  "commit": "c3fcafdc10146beb5919319d0683e44e3c30d537",
+  "archiveUrl": "https://codeload.github.com/TsudaKageyu/minhook/zip/c3fcafdc10146beb5919319d0683e44e3c30d537",
+  "archiveSha256": "CDCB160F734D81BD4D235DFEA79E3F5A661C8EF0AB74FA814272AA5449069034",
+  "license": "BSD-2-Clause; retain complete LICENSE.txt including HDE notices",
+  "sourceModified": false
+}

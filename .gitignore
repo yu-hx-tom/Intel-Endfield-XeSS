@@ -1,0 +1,14 @@
+/.tools/
+/.cache/
+/build/
+/out/
+/dist/
+/rea-ghidra-*/
+/third_party/.cache/
+/third_party/xess/
+/third_party/Vulkan-Headers/
+__pycache__/
+*.py[cod]
+
+
+/build-release/

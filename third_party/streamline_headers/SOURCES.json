@@ -1,0 +1,43 @@
+{
+  "repository": "https://github.com/NVIDIA-RTX/Streamline",
+  "tag": "v2.10.3",
+  "source": "https://raw.githubusercontent.com/NVIDIA-RTX/Streamline/v2.10.3/include/",
+  "files": [
+    {
+      "file": "license.txt",
+      "sha256": "7b6f23e7d6f3ad6292f9308d2b42cdc3d82ae4e9b2abb55f230279d83bedd43d"
+    },
+    {
+      "file": "sl_appidentity.h",
+      "sha256": "1337385ac9867d66fa6beb34c750e79aaf25a74a156a47e83f24937299dade87"
+    },
+    {
+      "file": "sl_consts.h",
+      "sha256": "69a9f35aeecd7fbf68a997872ba2e29f27af7da4675f76b94628393d14474abf"
+    },
+    {
+      "file": "sl_core_api.h",
+      "sha256": "328dc3a2c1dee579c200ca97e2d5b1ec38c893be4ba2745ef5ad506af7172e81"
+    },
+    {
+      "file": "sl_core_types.h",
+      "sha256": "19135fdbf924a06a32cb5cff755161477df859a905da48e31ad0fcd3e142a97e"
+    },
+    {
+      "file": "sl_device_wrappers.h",
+      "sha256": "af7741305b1a468c3a83efaa2005ecd53d2ffd7aadb8ec6868c9dcb4a8a8e3a1"
+    },
+    {
+      "file": "sl_result.h",
+      "sha256": "2a0f6c12863bdc00b38910a5ec85d1f083c5671ee817a920afe626ac2a9100f7"
+    },
+    {
+      "file": "sl_struct.h",
+      "sha256": "a093a6fc35779a81645b98a05e08cdabee237f16f0a6bf42f8bd8c3b756b0fa9"
+    },
+    {
+      "file": "sl_version.h",
+      "sha256": "86d45ee548ebdf0a71c58573105402dac997ff5607a9f93184b64d72c71ad47d"
+    }
+  ]
+}

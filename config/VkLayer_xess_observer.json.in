@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_XESS_bridge_observer",
+    "type": "GLOBAL",
+    "library_path": "@OBSERVER_LIBRARY_PATH@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "Local diagnostic observer for Vulkan to XeSS bridge research",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    }
+  }
+}

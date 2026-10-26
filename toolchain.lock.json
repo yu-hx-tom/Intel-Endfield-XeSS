@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "platform": "windows-x86_64",
+  "packages": [
+    {
+      "name": "llvm-mingw",
+      "version": "20261006",
+      "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip",
+      "archive": "llvm-mingw-20261006-ucrt-x86_64.zip",
+      "sha256": "317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a",
+      "sizeBytes": 190836485,
+      "directory": "llvm-mingw-20261006-ucrt-x86_64",
+      "archiveContainsRoot": true,
+      "executables": ["bin/x86_64-w64-mingw32-clang++.exe", "bin/clang.exe"]
+    },
+    {
+      "name": "cmake",
+      "version": "4.4.4",
+      "url": "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip",
+      "archive": "cmake-4.4.4-windows-x86_64.zip",
+      "sha256": "bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536",
+      "sizeBytes": 54400562,
+      "directory": "cmake-4.4.4-windows-x86_64",
+      "archiveContainsRoot": true,
+      "executables": ["bin/cmake.exe", "bin/ctest.exe"]
+    },
+    {
+      "name": "ninja",
+      "version": "1.13.2",
+      "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+      "archive": "ninja-1.13.2-win.zip",
+      "sha256": "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65",
+      "sizeBytes": 291570,
+      "directory": "ninja-1.13.2",
+      "archiveContainsRoot": false,
+      "executables": ["ninja.exe"]
+    }
+  ]
+}
