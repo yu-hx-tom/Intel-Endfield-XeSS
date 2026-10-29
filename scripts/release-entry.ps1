@@ -15,7 +15,8 @@ try {
     $manager=Join-Path $PSScriptRoot 'manage-observer-install.ps1'
     if($Action -in @('Verify','Install')){
         $plan=& $manager -Action ReviewPlan -SourceDirectory (Join-Path $PSScriptRoot 'payload/observer') -WithModLauncher -ModPayloadDirectory (Join-Path $PSScriptRoot 'mod') -WithXeFGSdk | ConvertFrom-Json
-        if($plan.changesPerformed -or $plan.copiedFiles.Count -ne 12){throw 'Unexpected payload review.'}
+        $expectedFiles=if($json.fsr4XmxPackaged){14}else{12}
+        if($plan.changesPerformed -or $plan.copiedFiles.Count -ne $expectedFiles){throw 'Unexpected payload review.'}
         if($Action -eq 'Verify'){
             [ordered]@{passed=$true;flavor=$json.flavor;version=$json.version;files=$json.files.Count;installationChanged=$false}|ConvertTo-Json
             return

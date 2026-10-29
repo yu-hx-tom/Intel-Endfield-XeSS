@@ -383,17 +383,19 @@ void replacementUndefinedLayoutWrappers(){
     }
 }
 void replacementPhotoOverwrite(){
-    for(bool auxiliary:{false,true})for(unsigned variant=0;variant<36;++variant){
+    for(unsigned kind:{0u,1u,2u,3u,4u})for(unsigned variant=0;variant<40;++variant){
+        const bool auxiliary=kind==1,menuMask=kind>=2,dualMask=kind>=3;
         Fixture f;GameSrRuntime runtime(&f.state,true);
         xess_vk::CommandRecordingFacts facts;facts.command=bits(command);facts.rpRecordingGeneration=1;facts.commonRecordOrder=2;
         dm::DispatchEvidence evidence;evidence.pipeline={0xCB00,1};evidence.metadataAccepted=evidence.guardImagesKnown=true;
         evidence.count=evidence.guardImageCount=3;evidence.groups={141,80,1};
         auto& output=evidence.bindings[0];output.setIndex=output.binding=0;output.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        output.image={0xCB10,1};output.view={0xCB11,1};output.viewType=VK_IMAGE_VIEW_TYPE_2D;output.viewFormat=VK_FORMAT_R16_SFLOAT;
+        if(kind==3)output.binding=1;
+        output.image={0xCB10,1};output.view={0xCB11,1};output.viewType=VK_IMAGE_VIEW_TYPE_2D;output.viewFormat=menuMask?VK_FORMAT_R8_UNORM:VK_FORMAT_R16_SFLOAT;
         output.declaredLayout=VK_IMAGE_LAYOUT_GENERAL;output.range={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-        output.imageDescription={VK_FORMAT_R16_SFLOAT,1128,634,1,1,1,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_USAGE_STORAGE_BIT};
-        for(unsigned n=1;n<3;++n){auto& b=evidence.bindings[n];b.binding=n;b.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;b.image={0xCB20+n,1};}
-        runtime.replacementPipelines[0]={evidence.pipeline,auxiliary?xess_vk::sr_native_shaders::auxiliaryWriterProfile:xess_vk::sr_native_shaders::photoWriterProfile};
+        output.imageDescription={output.viewFormat,1128,634,1,1,1,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_USAGE_STORAGE_BIT};
+        for(unsigned n=1;n<3;++n){auto& b=evidence.bindings[n];b.binding=n+unsigned(dualMask);b.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;b.image={0xCB20+n,1};}
+        runtime.replacementPipelines[0]={evidence.pipeline,dualMask?xess_vk::sr_native_shaders::menuDualMaskWriterProfile:menuMask?xess_vk::sr_native_shaders::menuMaskWriterProfile:auxiliary?xess_vk::sr_native_shaders::auxiliaryWriterProfile:xess_vk::sr_native_shaders::photoWriterProfile};
         switch(variant){
         case 1:output.range.levelCount=VK_REMAINING_MIP_LEVELS;output.range.layerCount=VK_REMAINING_ARRAY_LAYERS;break;
         case 2:output.imageDescription.width=output.imageDescription.height=1;evidence.groups={1,1,1};break;
@@ -413,6 +415,10 @@ void replacementPhotoOverwrite(){
         case 31:++evidence.groups[0];break;case 32:evidence.issues=dm::bit(dm::Issue::UnsupportedDispatch);break;
         case 33:output.view={};break;case 34:evidence.guardImagesKnown=false;break;
         case 35:output.viewFormat=VK_FORMAT_R16G16B16A16_SFLOAT;output.imageDescription.format=VK_FORMAT_R16G16B16A16_SFLOAT;break;
+        case 36:output.imageDescription.width=564;output.imageDescription.height=317;evidence.groups={71,40,1};break;
+        case 37:output.imageDescription.width=320;output.imageDescription.height=180;evidence.groups={40,23,1};break;
+        case 38:output.viewFormat=menuMask?VK_FORMAT_R16_SFLOAT:VK_FORMAT_R8_UNORM;output.imageDescription.format=output.viewFormat;break;
+        case 39:output.imageDescription.width=640;output.imageDescription.height=360;evidence.groups={80,45,1};break;
         }
         const dm::Key otherMissing{0xCB40,1};runtime.nativeTransaction.produce(output.image,true,2);
         runtime.nativeTransaction.produce(otherMissing,true,7);sr::DispatchTicket ticket;
@@ -420,9 +426,9 @@ void replacementPhotoOverwrite(){
         require(runtime.nativeTransaction.watches(output.image),"intercept alone never claims that a writer has been recorded");
         runtime.replacementFullWriteReturned(facts,!suppressed);
         require(!runtime.fullWriteRetiredWhileSuppressed,"a suppressed writer never retires missing content");
-        if(variant==29||variant==30)require((auxiliary?runtime.replacementAuxFullWritesSkipped:runtime.replacementPhotoFullWritesSkipped)==1&&
-            !(auxiliary?runtime.replacementAuxFullWrites:runtime.replacementPhotoFullWrites),"aliased full writer is counted as skipped, never applied");
-        const bool full=variant<3||(auxiliary&&variant==35);
+        if(variant==29||variant==30)require((menuMask?runtime.replacementMenuMaskSkipped:auxiliary?runtime.replacementAuxFullWritesSkipped:runtime.replacementPhotoFullWritesSkipped)==1&&
+            !(menuMask?runtime.replacementMenuMaskFullWrites:auxiliary?runtime.replacementAuxFullWrites:runtime.replacementPhotoFullWrites),"aliased full writer is counted as skipped, never applied");
+        const bool full=variant<3||(auxiliary&&variant==35)||variant==36||variant==37||variant==39;
         require(runtime.nativeTransaction.watches(output.image)!=full&&runtime.nativeTransaction.counts().discards==unsigned(full),
             "both verified full writers retire their overwritten destination, including reused luma textures");
         require(runtime.nativeTransaction.omitted(otherMissing),"photo overwrite never clears another missing intermediate");

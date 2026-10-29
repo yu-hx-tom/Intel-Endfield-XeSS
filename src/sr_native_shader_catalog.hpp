@@ -38,6 +38,19 @@ inline constexpr int photoWriterProfile=auxiliaryWriterProfile+1;
 // full-destination rule; never suppressed.
 inline constexpr std::string_view characterMenuWriterSha256="e5a587642c5a773639e0221cb5fdee0d2a618ae2972c455ca00c0d2247993d3b";
 inline constexpr int characterMenuWriterProfile=photoWriterProfile+1;
+// Captured menu post-process: set0/b0 is R8 and never read. Its final write
+// uses GlobalInvocationID.xy, an 8x8x1 grid and the output-size bounds check.
+// Other sampled inputs remain consumers. This shader is never suppressed.
+inline constexpr std::string_view menuMaskWriterSha256="e816dd0353de5607b2160bc78e54070ac19b26bf4fd4db6b0175c05999fc8bb3";
+inline constexpr int menuMaskWriterProfile=characterMenuWriterProfile+1;
+// Captured high-quality menu: both R8 b0/b1 are unconditionally written at
+// GlobalInvocationID.xy (8x8x1), with no reads of either output. Sampled b2/b3
+// stay consumers; this kept post-process is never an omitted FSR core.
+inline constexpr std::string_view menuDualMaskWriterSha256="58c2e0911a7dac7c3e4bb70cd686efb51eb8038a09bc44299770d9ba1000e5c1";
+inline constexpr int menuDualMaskWriterProfile=menuMaskWriterProfile+1;
+constexpr bool isMenuMaskWriter(int profile) noexcept {
+    return profile==menuMaskWriterProfile||profile==menuDualMaskWriterProfile;
+}
 // The character-menu post-process that samples that image (8x8, writes b0).
 // Only a menu signal for FG gating; it grants no content exception.
 inline constexpr std::string_view characterMenuReaderSha256="ce1c476892a965633994ff336b12ac4021ba731e67226249785c21443c15eccd";
@@ -50,7 +63,7 @@ constexpr Policy policy(std::string_view sha256) noexcept {
 }
 constexpr bool needsTypedEvidence(std::string_view sha256) noexcept {
     return sha256.size()!=64||sha256.front()=='\0'||find(sha256)||
-        sha256==auxiliaryWriterSha256||sha256==photoWriterSha256||sha256==characterMenuWriterSha256;
+        sha256==auxiliaryWriterSha256||sha256==photoWriterSha256||sha256==characterMenuWriterSha256||sha256==menuMaskWriterSha256||sha256==menuDualMaskWriterSha256;
 }
 constexpr const char* policyName(Policy p) noexcept {
     switch(p){case Policy::KeepMotionInput:return "keep_motion_input_producer";

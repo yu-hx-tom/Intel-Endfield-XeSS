@@ -42,6 +42,8 @@
 #include "xess_sr_device_caps.hpp"
 #include "sr_game_creation.hpp"
 #include "sr_execute_overlay.hpp"
+#include "fsr4_bridge.hpp"
+#include "sr_backend.hpp"
 #include "sr_native_replacement.hpp"
 #include "xess_sr.hpp"
 #include "continuous_timing.hpp"
@@ -162,6 +164,8 @@ struct DeviceState {
     xess_vk::sr_game::RuntimeRequirementsAdmission* srAdmission;
     bool srRuntimeRequested;
     GameSrRuntime* srRuntime;
+    // DeviceState is zero-allocated; atomic_ref preserves its existing storage lifetime.
+    alignas(std::atomic_ref<xess_vk::fsr4::Bridge*>::required_alignment) xess_vk::fsr4::Bridge* fsr4Bridge;
     std::uint32_t srQueueFamily;
     bool srSingleQueue,srSeparateLayouts;
     SRWLOCK trackingCpuLock;
@@ -594,6 +598,15 @@ template<class T> DeviceState* findDevice(T handle) noexcept {
     return state;
 }
 
+inline xess_vk::fsr4::Bridge* currentFsr4Bridge(DeviceState* state)noexcept {
+    return std::atomic_ref(state->fsr4Bridge).load(std::memory_order_acquire);
+}
+inline void publishFsr4Bridge(DeviceState* state,xess_vk::fsr4::Bridge* bridge)noexcept {
+    std::atomic_ref(state->fsr4Bridge).store(bridge,std::memory_order_release);
+}
+inline VkCommandBuffer srCommand(DeviceState* state,VkCommandBuffer command)noexcept {
+    const auto bridge=currentFsr4Bridge(state);return bridge?bridge->command(command):command;
+}
 template<class T> uint64_t bits(T handle) noexcept;
 void queueCallSlow(void*, const char*, std::uint64_t, const xess_vk::wsi_acquire::QueueCall&) noexcept;
 template<class Call> VkResult queueDriver(DeviceState* state, const char* api, VkQueue queue, Call&& call) {
@@ -779,6 +792,19 @@ void writeMeasurementSummaryLine(const char* data,DWORD size) noexcept {
     if(measurementSummaryTestSink){measurementSummaryTestSink(data,size);return;}
 #endif
     writeDiagnostic(DiagnosticStream::Summary,data,size);
+}
+// Diagnostic-only R8 storage sources cover menu/preset variants in one run.
+bool fsr4MenuProbeEnabled()noexcept{return diagnosticLoggingEnabled()&&xess_vk::sr_backend::startup()==xess_vk::sr_backend::Kind::Fsr4XmxLite;}
+void fsr4MenuProbeLine(const char* text){
+    if(!fsr4MenuProbeEnabled()||!text)return;const auto size=strnlen(text,32767);if(!size||size>=32767)return;
+    char line[32768];std::memcpy(line,text,size);line[size]='\n';
+    // R8 storage shader bytes, once per hash. Normal release logging
+    // suppresses general shader archives, so this uses its existing async sink.
+    deliverDiagnostic(DiagnosticStream::Verbose,line,DWORD(size+1));
+}
+void captureFsr4MenuProbe(DeviceState* state,VkPipeline pipeline,std::uint64_t generation){
+    if(!fsr4MenuProbeEnabled())return;
+    xess_vk::compute_observer::selectArchivedShader(state->srShaders,pipeline,generation,fsr4MenuProbeLine);
 }
 void streamlineLog(const char* line) noexcept {
     if (!diagnosticLoggingEnabled() || !line) return;
@@ -3789,7 +3815,9 @@ OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physic
         state->researchDiagnostics = researchDiagnostics&&!productRoute;
         state->srObservationRequested=productRoute&&(xess_vk::diagnostic_flags::srObservation()||xess_vk::diagnostic_flags::srFullGraphObservation()||state->srRuntimeRequested);
         state->srTailDiagnostics=state->srObservationRequested&&(!state->srRuntimeRequested||xess_vk::diagnostic_flags::srObservation()||xess_vk::diagnostic_flags::srFullGraphObservation());
-        state->srGpuRequested=state->srObservationRequested&&xess_vk::presentation::gpuTimestampsRequested();
+        // XeSS's in-command-buffer span cannot measure a split cross-API SR transaction.
+        state->srGpuRequested=state->srObservationRequested&&xess_vk::presentation::gpuTimestampsRequested()&&
+            xess_vk::sr_backend::startup()!=xess_vk::sr_backend::Kind::Fsr4XmxLite;
         if (!upscaleConflict && (fiMetadataRequested || upscaleMetadataRequested)) {
             try { state->imageInventory = new xess_vk::image_inventory::Inventory<>; } catch (...) {}
             if (state->imageInventory) {
@@ -3807,7 +3835,8 @@ OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physic
                 selection.boolean("compact_ordinary_dispatch",state->descriptors&&descriptorConfig.compactOrdinaryDispatch);
                 selection.boolean("global_descriptor_mutations_retained",true);selection.text("unknown_pipeline_policy","full_typed_evidence");selection.write();}
             if(state->srObservationRequested&&state->descriptors)
-                state->srShaders=xess_vk::compute_observer::createShaderArchive(*device,streamlineLog,(xess_vk::diagnostic_flags::srFullGraphObservation()||xess_vk::diagnostic_flags::srNativeReplacementAvailable()));
+                state->srShaders=xess_vk::compute_observer::createShaderArchive(*device,streamlineLog,(xess_vk::diagnostic_flags::srFullGraphObservation()||xess_vk::diagnostic_flags::srNativeReplacementAvailable()),
+                    fsr4MenuProbeEnabled());
             if constexpr(researchDiagnostics) if(renderTailRequested()) {
                 try {state->renderTail=new xess_vk::render_tail::Store(bits(*device),streamlineLog);}catch(...){}
                 if constexpr(researchDiagnostics) if(state->renderTail&&!renderTailArmPath(state)){delete state->renderTail;state->renderTail=nullptr;}
@@ -5285,7 +5314,8 @@ OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
         if(state->srRuntime)srRuntimeTiming=state->srRuntime->beforeSubmit(rpTicket);
         if(state->srGpuRequested)srGpuTicket=srGpuBeforeSubmit(state,rpTicket);
         if(state->measurements){LARGE_INTEGER qpc{};QueryPerformanceCounter(&qpc);sourceEntryQpc=qpc.QuadPart;sourceEntryNs=xess_vk::cpuWallNowNs();}
-        return state->submit(queue, count, widened.empty() ? infos : widened.data(), fence); }); });
+        const auto bridge=currentFsr4Bridge(state);
+        return bridge?bridge->submit(queue,count,widened.empty()?infos:widened.data(),fence):state->submit(queue,count,widened.empty()?infos:widened.data(),fence); }); });
     const auto originalError = GetLastError();
     srGpuAfterSubmit(state,srGpuTicket?&*srGpuTicket:nullptr,result);
     if(state->srRuntime)state->srRuntime->submit(rpTicket,result,srRuntimeTiming);
@@ -5370,7 +5400,8 @@ VkResult submit2Observed(DeviceState* state, PFN_vkQueueSubmit2 submit, const ch
         if(state->srRuntime)srRuntimeTiming=state->srRuntime->beforeSubmit(rpTicket);
         if(state->srGpuRequested)srGpuTicket=srGpuBeforeSubmit(state,rpTicket);
         if(state->measurements){LARGE_INTEGER qpc{};QueryPerformanceCounter(&qpc);sourceEntryQpc=qpc.QuadPart;sourceEntryNs=xess_vk::cpuWallNowNs();}
-        return submit(queue, count, widened.empty() ? infos : widened.data(), fence); }); });
+        const auto bridge=currentFsr4Bridge(state);
+        return bridge?bridge->submit2(queue,count,widened.empty()?infos:widened.data(),fence):submit(queue,count,widened.empty()?infos:widened.data(),fence); }); });
     const auto originalError = GetLastError();
     srGpuAfterSubmit(state,srGpuTicket?&*srGpuTicket:nullptr,result);
     if(state->srRuntime)state->srRuntime->submit(rpTicket,result,srRuntimeTiming);
@@ -5871,6 +5902,7 @@ OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice devi
             const auto tracked=xess_vk::descriptor_image_observer::pipelineCreated(state->descriptors,pipelines[i],&infos[i],result);
             if(state->srShaders&&tracked.accepted()){
                 xess_vk::compute_observer::archivePipeline(state->srShaders,pipelines[i],tracked.key.generation,&infos[i],result);
+                if(result==VK_SUCCESS)captureFsr4MenuProbe(state,pipelines[i],tracked.key.generation);
                 if(xess_vk::diagnostic_flags::fsrPipelineTracking())classifyCompactPipeline(state,tracked.key);
             }
         }
@@ -6010,13 +6042,13 @@ OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(VkDevice device, c
 OBS_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer buffer) {
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->endCommandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
-    if(srSdkDepth){return state->endCommandBuffer(buffer);}
+    if(srSdkDepth){return state->endCommandBuffer(srCommand(state,buffer));}
     // replacementEnd does not touch render-pass state, so one query serves both.
     const auto endFacts=state->srRuntime||state->srObservationRequested?xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer):xess_vk::CommandRecordingFacts{};
     if(state->srRuntime)state->srRuntime->replacementEnd(endFacts);
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
     const auto tailKey=state->srObservationRequested?stc::key(endFacts):stc::Key{};
-    const auto result = tracking.driver([&] { return state->endCommandBuffer(buffer); });
+    const auto result = tracking.driver([&] { return state->endCommandBuffer(srCommand(state,buffer)); });
     const auto originalError=GetLastError();if(result!=VK_SUCCESS)rawRetireRecording(state,rawKey(state,buffer));
     srTailFinish(state,tailKey,result);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::end(state->candidateSync, buffer, result);
@@ -6030,13 +6062,13 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer buffe
     uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, uint32_t imageCount, const VkImageMemoryBarrier* images) {
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdPipelineBarrier) return;
-    if(srSdkDepth){state->cmdPipelineBarrier(buffer,src,dst,flags,memoryCount,memory,bufferCount,buffers,imageCount,images);return;}
+    if(srSdkDepth){state->cmdPipelineBarrier(srCommand(state,buffer),src,dst,flags,memoryCount,memory,bufferCount,buffers,imageCount,images);return;}
     srTailCommand(state,buffer,[&]{return stc::barrier(src,dst,flags,memoryCount,memory,bufferCount,buffers,imageCount,images);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
     std::vector<VkImageMemoryBarrier> copy; const VkImageMemoryBarrier* driverImages{};
     try { driverImages = state->fakeEnabled ? xess_vk::presentation::fake_layout::barriers(imageCount, images, fakeImagePredicate(state), copy) : images; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdPipelineBarrier(buffer, src, dst, flags, memoryCount, memory, bufferCount, buffers, imageCount, driverImages); });
+    tracking.driver([&] { return state->cmdPipelineBarrier(srCommand(state,buffer), src, dst, flags, memoryCount, memory, bufferCount, buffers, imageCount, driverImages); });
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::barriers(state->candidateSync, buffer, src, dst, flags, imageCount, images);
     xess_vk::render_pass_observer::explicitImageBarriers(state->renderPass, buffer,src,dst,flags,imageCount,images);
     srUndefinedLayoutDiscards(state,buffer,imageCount,images);
@@ -6044,26 +6076,26 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer buffe
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer buffer, const VkDependencyInfo* info) {
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdPipelineBarrier2) return;
-    if(srSdkDepth){state->cmdPipelineBarrier2(buffer,info);return;}
+    if(srSdkDepth){state->cmdPipelineBarrier2(srCommand(state,buffer),info);return;}
     srTailCommand(state,buffer,[&]{return stc::barrier2(info);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
     std::vector<VkDependencyInfo> copy; std::vector<std::vector<VkImageMemoryBarrier2>> images; const VkDependencyInfo* driverInfo{};
     try { driverInfo = state->fakeEnabled ? xess_vk::presentation::fake_layout::dependencies(1, info, fakeImagePredicate(state), copy, images) : info; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdPipelineBarrier2(buffer, driverInfo); }); if constexpr(researchDiagnostics) xess_vk::candidate_sync::barriers2(state->candidateSync, buffer, info);
+    tracking.driver([&] { return state->cmdPipelineBarrier2(srCommand(state,buffer), driverInfo); }); if constexpr(researchDiagnostics) xess_vk::candidate_sync::barriers2(state->candidateSync, buffer, info);
     xess_vk::render_pass_observer::explicitImageBarriers2(state->renderPass, buffer,info);
     srUndefinedLayoutDiscards2(state,buffer,1,info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2KHR(VkCommandBuffer buffer, const VkDependencyInfo* info) {
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdPipelineBarrier2Khr) return;
-    if(srSdkDepth){state->cmdPipelineBarrier2Khr(buffer,info);return;}
+    if(srSdkDepth){state->cmdPipelineBarrier2Khr(srCommand(state,buffer),info);return;}
     srTailCommand(state,buffer,[&]{return stc::barrier2(info,stc::Api::Khr2);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
     std::vector<VkDependencyInfo> copy; std::vector<std::vector<VkImageMemoryBarrier2>> images; const VkDependencyInfo* driverInfo{};
     try { driverInfo = state->fakeEnabled ? xess_vk::presentation::fake_layout::dependencies(1, info, fakeImagePredicate(state), copy, images) : info; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdPipelineBarrier2Khr(buffer, driverInfo); }); if constexpr(researchDiagnostics) xess_vk::candidate_sync::barriers2(state->candidateSync, buffer, info);
+    tracking.driver([&] { return state->cmdPipelineBarrier2Khr(srCommand(state,buffer), driverInfo); }); if constexpr(researchDiagnostics) xess_vk::candidate_sync::barriers2(state->candidateSync, buffer, info);
     xess_vk::render_pass_observer::explicitImageBarriers2(state->renderPass, buffer,info);
     srUndefinedLayoutDiscards2(state,buffer,1,info);
 }
@@ -6077,7 +6109,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer buffer, ui
     std::vector<VkImageMemoryBarrier> copy; const VkImageMemoryBarrier* driverImages{};
     try { driverImages = state->fakeEnabled ? xess_vk::presentation::fake_layout::barriers(imageCount, images, fakeImagePredicate(state), copy) : images; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdWaitEvents(buffer, eventCount, events, src, dst, memoryCount, memory, bufferCount, buffers, imageCount, driverImages); });
+    tracking.driver([&] { return state->cmdWaitEvents(srCommand(state,buffer), eventCount, events, src, dst, memoryCount, memory, bufferCount, buffers, imageCount, driverImages); });
     srUndefinedLayoutDiscards(state,buffer,imageCount,images);
     xess_vk::render_pass_observer::unsupported(state->renderPass, buffer, xess_vk::render_pass_metadata::Issue::UnsupportedExtension);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::Events);
@@ -6091,7 +6123,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2(VkCommandBuffer buffer, u
     std::vector<VkDependencyInfo> copy; std::vector<std::vector<VkImageMemoryBarrier2>> images; const VkDependencyInfo* driverInfos{};
     try { driverInfos = state->fakeEnabled ? xess_vk::presentation::fake_layout::dependencies(count, infos, fakeImagePredicate(state), copy, images) : infos; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdWaitEvents2(buffer, count, events, driverInfos); });
+    tracking.driver([&] { return state->cmdWaitEvents2(srCommand(state,buffer), count, events, driverInfos); });
     srUndefinedLayoutDiscards2(state,buffer,count,infos);
     xess_vk::render_pass_observer::unsupported(state->renderPass, buffer, xess_vk::render_pass_metadata::Issue::UnsupportedExtension);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::Events);
@@ -6105,7 +6137,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2KHR(VkCommandBuffer buffer
     std::vector<VkDependencyInfo> copy; std::vector<std::vector<VkImageMemoryBarrier2>> images; const VkDependencyInfo* driverInfos{};
     try { driverInfos = state->fakeEnabled ? xess_vk::presentation::fake_layout::dependencies(count, infos, fakeImagePredicate(state), copy, images) : infos; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return state->cmdWaitEvents2Khr(buffer, count, events, driverInfos); });
+    tracking.driver([&] { return state->cmdWaitEvents2Khr(srCommand(state,buffer), count, events, driverInfos); });
     srUndefinedLayoutDiscards2(state,buffer,count,infos);
     xess_vk::render_pass_observer::unsupported(state->renderPass, buffer, xess_vk::render_pass_metadata::Issue::UnsupportedExtension);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::Events);
@@ -6114,12 +6146,12 @@ namespace {
 void setEvent2Mapped(DeviceState* state, PFN_vkCmdSetEvent2 set, VkCommandBuffer buffer, VkEvent event,
     const VkDependencyInfo* info, xess_vk::CpuWallClock::time_point started) {
     if (!state || !set) return;
-    if (!state->fakeEnabled) { set(buffer, event, info); return; }
+    if (!state->fakeEnabled) { set(srCommand(state,buffer),event,info); return; }
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, started);
     std::vector<VkDependencyInfo> copy; std::vector<std::vector<VkImageMemoryBarrier2>> images; const VkDependencyInfo* driverInfo{};
     try { driverInfo = state->fakeEnabled ? xess_vk::presentation::fake_layout::dependencies(1, info, fakeImagePredicate(state), copy, images) : info; }
     catch (...) { fakeRecordingFailed(state); return; }
-    tracking.driver([&] { return set(buffer, event, driverInfo); });
+    tracking.driver([&] { return set(srCommand(state,buffer),event,driverInfo); });
     xess_vk::render_pass_observer::unsupported(state->renderPass, buffer, xess_vk::render_pass_metadata::Issue::UnsupportedExtension);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::Events);
 }
@@ -6141,7 +6173,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer buffe
     srProductCommand(state,buffer,[&]{return stc::beginRenderPass(info,contents);});
     srTailCommand(state,buffer,[&]{return stc::beginRenderPass(info,contents);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdBeginRenderPass(buffer, info, contents); });
+    tracking.driver([&] { return state->cmdBeginRenderPass(srCommand(state,buffer), info, contents); });
     xess_vk::render_pass_observer::beginRenderPass(state->renderPass, buffer, info, contents);
     renderTailPass(state,buffer,info);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6153,7 +6185,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer buff
     srProductCommand(state,buffer,[&]{return stc::beginRenderPass2(info,begin);});
     srTailCommand(state,buffer,[&]{return stc::beginRenderPass2(info,begin);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdBeginRenderPass2(buffer, info, begin); });
+    tracking.driver([&] { return state->cmdBeginRenderPass2(srCommand(state,buffer), info, begin); });
     xess_vk::render_pass_observer::beginRenderPass2(state->renderPass, buffer, info, begin);
     renderTailPass(state,buffer,info);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6165,7 +6197,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2KHR(VkCommandBuffer b
     srProductCommand(state,buffer,[&]{return stc::beginRenderPass2(info,begin,stc::Api::Khr2);});
     srTailCommand(state,buffer,[&]{return stc::beginRenderPass2(info,begin,stc::Api::Khr2);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdBeginRenderPass2Khr(buffer, info, begin); });
+    tracking.driver([&] { return state->cmdBeginRenderPass2Khr(srCommand(state,buffer), info, begin); });
     xess_vk::render_pass_observer::beginRenderPass2(state->renderPass, buffer, info, begin);
     renderTailPass(state,buffer,info);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6175,7 +6207,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer buffer, V
     auto* state = findDevice(buffer); if (!state || !state->cmdNextSubpass) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdNextSubpass",{contents});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdNextSubpass(buffer, contents); });
+    tracking.driver([&] { return state->cmdNextSubpass(srCommand(state,buffer), contents); });
     xess_vk::render_pass_observer::nextSubpass(state->renderPass, buffer);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
 }
@@ -6184,7 +6216,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer buffer, 
     auto* state = findDevice(buffer); if (!state || !state->cmdNextSubpass2) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdNextSubpass2",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdNextSubpass2(buffer, begin, end); });
+    tracking.driver([&] { return state->cmdNextSubpass2(srCommand(state,buffer), begin, end); });
     xess_vk::render_pass_observer::nextSubpass(state->renderPass, buffer);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
 }
@@ -6193,7 +6225,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2KHR(VkCommandBuffer buffe
     auto* state = findDevice(buffer); if (!state || !state->cmdNextSubpass2Khr) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdNextSubpass2KHR",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdNextSubpass2Khr(buffer, begin, end); });
+    tracking.driver([&] { return state->cmdNextSubpass2Khr(srCommand(state,buffer), begin, end); });
     xess_vk::render_pass_observer::nextSubpass(state->renderPass, buffer);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
 }
@@ -6202,7 +6234,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer buffer)
     auto* state = findDevice(buffer); if (!state || !state->cmdEndRenderPass) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdEndRenderPass",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdEndRenderPass(buffer); });
+    tracking.driver([&] { return state->cmdEndRenderPass(srCommand(state,buffer)); });
     xess_vk::render_pass_observer::endRenderPass(state->renderPass, buffer);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active())state->renderTail->endPass(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer));
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6212,7 +6244,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer buffer
     auto* state = findDevice(buffer); if (!state || !state->cmdEndRenderPass2) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdEndRenderPass2",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdEndRenderPass2(buffer, end); });
+    tracking.driver([&] { return state->cmdEndRenderPass2(srCommand(state,buffer), end); });
     xess_vk::render_pass_observer::endRenderPass2(state->renderPass, buffer, end);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active())state->renderTail->endPass(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer));
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6222,7 +6254,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2KHR(VkCommandBuffer buf
     auto* state = findDevice(buffer); if (!state || !state->cmdEndRenderPass2Khr) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdEndRenderPass2KHR",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdEndRenderPass2Khr(buffer, end); });
+    tracking.driver([&] { return state->cmdEndRenderPass2Khr(srCommand(state,buffer), end); });
     xess_vk::render_pass_observer::endRenderPass2(state->renderPass, buffer, end);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active())state->renderTail->endPass(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer));
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6233,7 +6265,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer buffer
     srProductCommand(state,buffer,[&]{return stc::beginRendering(info);});
     srTailCommand(state,buffer,[&]{return stc::beginRendering(info);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdBeginRendering(buffer, info); });
+    tracking.driver([&] { return state->cmdBeginRendering(srCommand(state,buffer), info); });
     xess_vk::render_pass_observer::beginDynamicRendering(state->renderPass, buffer, info);
     renderTailDynamic(state,buffer,info);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6244,7 +6276,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderingKHR(VkCommandBuffer buf
     srProductCommand(state,buffer,[&]{return stc::beginRendering(info,stc::Api::Khr);});
     srTailCommand(state,buffer,[&]{return stc::beginRendering(info,stc::Api::Khr);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdBeginRenderingKhr(buffer, info); });
+    tracking.driver([&] { return state->cmdBeginRenderingKhr(srCommand(state,buffer), info); });
     xess_vk::render_pass_observer::beginDynamicRendering(state->renderPass, buffer, info);
     renderTailDynamic(state,buffer,info);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6254,7 +6286,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer buffer) 
     auto* state = findDevice(buffer); if (!state || !state->cmdEndRendering) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdEndRendering",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdEndRendering(buffer); });
+    tracking.driver([&] { return state->cmdEndRendering(srCommand(state,buffer)); });
     xess_vk::render_pass_observer::endDynamicRendering(state->renderPass, buffer);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active())state->renderTail->endPass(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer));
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6264,7 +6296,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderingKHR(VkCommandBuffer buffe
     auto* state = findDevice(buffer); if (!state || !state->cmdEndRenderingKhr) return;
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdEndRenderingKHR",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Recording, trackingStarted);
-    tracking.driver([&] { return state->cmdEndRenderingKhr(buffer); });
+    tracking.driver([&] { return state->cmdEndRenderingKhr(srCommand(state,buffer)); });
     xess_vk::render_pass_observer::endDynamicRendering(state->renderPass, buffer);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active())state->renderTail->endPass(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer));
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::RenderPass);
@@ -6283,7 +6315,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdExecuteCommands(VkCommandBuffer buffe
             const auto child=xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffers[n]);event.secondary[event.secondaryCount++]={bits(buffers[n]),child.rpRecordingGeneration};}
         state->renderTail->record(event);
     }
-    tracking.driver([&] { return state->cmdExecuteCommands(buffer, count, buffers); });
+    tracking.driver([&] { return state->cmdExecuteCommands(srCommand(state,buffer), count, buffers); });
     xess_vk::render_pass_observer::unsupported(state->renderPass, buffer, xess_vk::render_pass_metadata::Issue::Secondary);
     if constexpr(researchDiagnostics) xess_vk::candidate_sync::opaque(state->candidateSync, buffer, xess_vk::image_sync::Issue::SecondaryCommands);
 }
@@ -6347,68 +6379,68 @@ template<class Region>void tailBlits(DeviceState* s,VkCommandBuffer command,VkIm
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer b,VkImage src,VkImageLayout sl,VkImage dst,VkImageLayout dl,uint32_t count,const VkImageCopy* regions) {
     auto* s=findDevice(b);if(!s||!s->cmdCopyImage)return;
     srImageTouch(s,b,src);srImageTouch(s,b,dst);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage",{bits(src),sl,bits(dst),dl,count});snapshot.truncated=true;return snapshot;});tailCopies(s,b,src,sl,dst,dl,count,regions);s->cmdCopyImage(b,src,sl,dst,dl,count,regions);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage",{bits(src),sl,bits(dst),dl,count});snapshot.truncated=true;return snapshot;});tailCopies(s,b,src,sl,dst,dl,count,regions);s->cmdCopyImage(srCommand(s,b),src,sl,dst,dl,count,regions);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer b,const VkCopyImageInfo2* info) {
     auto* s=findDevice(b);if(!s||!s->cmdCopyImage2)return;
     srImageTouch(s,b,info?info->srcImage:VK_NULL_HANDLE);if(info)srImageTouch(s,b,info->dstImage);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage2",{});snapshot.truncated=true;return snapshot;});if(info)tailCopies(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions);s->cmdCopyImage2(b,info);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage2",{});snapshot.truncated=true;return snapshot;});if(info)tailCopies(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions);s->cmdCopyImage2(srCommand(s,b),info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2KHR(VkCommandBuffer b,const VkCopyImageInfo2* info) {
     auto* s=findDevice(b);if(!s||!s->cmdCopyImage2Khr)return;
     srImageTouch(s,b,info?info->srcImage:VK_NULL_HANDLE);if(info)srImageTouch(s,b,info->dstImage);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage2KHR",{});snapshot.truncated=true;return snapshot;});if(info)tailCopies(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions);s->cmdCopyImage2Khr(b,info);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdCopyImage2KHR",{});snapshot.truncated=true;return snapshot;});if(info)tailCopies(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions);s->cmdCopyImage2Khr(srCommand(s,b),info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer b,VkImage src,VkImageLayout sl,VkImage dst,VkImageLayout dl,uint32_t count,const VkImageBlit* regions,VkFilter filter) {
     auto* s=findDevice(b);if(!s||!s->cmdBlitImage)return;
     srImageTouch(s,b,src);srImageTouch(s,b,dst);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage",{bits(src),sl,bits(dst),dl,count,filter});snapshot.truncated=true;return snapshot;});tailBlits(s,b,src,sl,dst,dl,count,regions,filter);s->cmdBlitImage(b,src,sl,dst,dl,count,regions,filter);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage",{bits(src),sl,bits(dst),dl,count,filter});snapshot.truncated=true;return snapshot;});tailBlits(s,b,src,sl,dst,dl,count,regions,filter);s->cmdBlitImage(srCommand(s,b),src,sl,dst,dl,count,regions,filter);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage2(VkCommandBuffer b,const VkBlitImageInfo2* info) {
     auto* s=findDevice(b);if(!s||!s->cmdBlitImage2)return;
     srImageTouch(s,b,info?info->srcImage:VK_NULL_HANDLE);if(info)srImageTouch(s,b,info->dstImage);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage2",{});snapshot.truncated=true;return snapshot;});if(info)tailBlits(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions,info->filter);s->cmdBlitImage2(b,info);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage2",{});snapshot.truncated=true;return snapshot;});if(info)tailBlits(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions,info->filter);s->cmdBlitImage2(srCommand(s,b),info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage2KHR(VkCommandBuffer b,const VkBlitImageInfo2* info) {
     auto* s=findDevice(b);if(!s||!s->cmdBlitImage2Khr)return;
     srImageTouch(s,b,info?info->srcImage:VK_NULL_HANDLE);if(info)srImageTouch(s,b,info->dstImage);
-    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage2KHR",{});snapshot.truncated=true;return snapshot;});if(info)tailBlits(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions,info->filter);s->cmdBlitImage2Khr(b,info);
+    srTailCommand(s,b,[&]{auto snapshot=srTailOther("vkCmdBlitImage2KHR",{});snapshot.truncated=true;return snapshot;});if(info)tailBlits(s,b,info->srcImage,info->srcImageLayout,info->dstImage,info->dstImageLayout,info->regionCount,info->pRegions,info->filter);s->cmdBlitImage2Khr(srCommand(s,b),info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer b,uint32_t vertices,uint32_t instances,uint32_t firstVertex,uint32_t firstInstance) {
     const auto trackingStarted=trackingCpuStart();
     auto* s=findDevice(b);if(!s||!s->cmdDraw)return;
     TrackingCpuScope tracking(s,TrackingCpuGroup::Draw,trackingStarted);
     if(srProductDraw(s,b,stc::Kind::Draw))return;
-    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::Draw,{vertices,instances,firstVertex,firstInstance},stc::Api::Core);}))return;if(vertices&&instances)renderTailDraw(s,b);tracking.driver([&]{s->cmdDraw(b,vertices,instances,firstVertex,firstInstance);});
+    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::Draw,{vertices,instances,firstVertex,firstInstance},stc::Api::Core);}))return;if(vertices&&instances)renderTailDraw(s,b);tracking.driver([&]{s->cmdDraw(srCommand(s,b),vertices,instances,firstVertex,firstInstance);});
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer b,uint32_t indices,uint32_t instances,uint32_t firstIndex,int32_t vertexOffset,uint32_t firstInstance) {
     const auto trackingStarted=trackingCpuStart();
     auto* s=findDevice(b);if(!s||!s->cmdDrawIndexed)return;
     TrackingCpuScope tracking(s,TrackingCpuGroup::Draw,trackingStarted);
     if(srProductDraw(s,b,stc::Kind::DrawIndexed))return;
-    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndexed,{indices,instances,firstIndex,static_cast<std::uint64_t>(static_cast<std::int64_t>(vertexOffset)),firstInstance},stc::Api::Core);}))return;if(indices&&instances)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndexed(b,indices,instances,firstIndex,vertexOffset,firstInstance);});
+    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndexed,{indices,instances,firstIndex,static_cast<std::uint64_t>(static_cast<std::int64_t>(vertexOffset)),firstInstance},stc::Api::Core);}))return;if(indices&&instances)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndexed(srCommand(s,b),indices,instances,firstIndex,vertexOffset,firstInstance);});
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer b,VkBuffer indirect,VkDeviceSize offset,uint32_t count,uint32_t stride) {
     const auto trackingStarted=trackingCpuStart();
     auto* s=findDevice(b);if(!s||!s->cmdDrawIndirect)return;
     TrackingCpuScope tracking(s,TrackingCpuGroup::Draw,trackingStarted);
     if(srProductDraw(s,b,stc::Kind::DrawIndirect))return;
-    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndirect,{bits(indirect),offset,count,stride},stc::Api::Core);}))return;if(count)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndirect(b,indirect,offset,count,stride);});
+    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndirect,{bits(indirect),offset,count,stride},stc::Api::Core);}))return;if(count)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndirect(srCommand(s,b),indirect,offset,count,stride);});
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer b,VkBuffer indirect,VkDeviceSize offset,uint32_t count,uint32_t stride) {
     const auto trackingStarted=trackingCpuStart();
     auto* s=findDevice(b);if(!s||!s->cmdDrawIndexedIndirect)return;
     TrackingCpuScope tracking(s,TrackingCpuGroup::Draw,trackingStarted);
     if(srProductDraw(s,b,stc::Kind::DrawIndexedIndirect))return;
-    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndexedIndirect,{bits(indirect),offset,count,stride},stc::Api::Core);}))return;if(count)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndexedIndirect(b,indirect,offset,count,stride);});
+    if(srTailCommand(s,b,[&]{return srTailSimple(stc::Kind::DrawIndexedIndirect,{bits(indirect),offset,count,stride},stc::Api::Core);}))return;if(count)renderTailDraw(s,b);tracking.driver([&]{s->cmdDrawIndexedIndirect(srCommand(s,b),indirect,offset,count,stride);});
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer buffer, VkPipelineBindPoint bindPoint, VkPipeline pipeline) {
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdBindPipeline) return;
-    if(srSdkDepth){state->cmdBindPipeline(buffer,bindPoint,pipeline);return;}
+    if(srSdkDepth){state->cmdBindPipeline(srCommand(state,buffer),bindPoint,pipeline);return;}
     srTailCommand(state,buffer,[&]{return srTailSimple(stc::Kind::BindPipeline,{bindPoint,bits(pipeline)},stc::Api::Core);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
-    tracking.driver([&] { return state->cmdBindPipeline(buffer, bindPoint, pipeline); });
+    tracking.driver([&] { return state->cmdBindPipeline(srCommand(state,buffer), bindPoint, pipeline); });
     if constexpr(researchDiagnostics) if (state->compute) xess_vk::compute_observer::bindPipeline(state->compute, buffer, bindPoint, pipeline);
     xess_vk::descriptor_image_observer::bindPipeline(state->descriptors,buffer,bindPoint,pipeline);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active()&&bindPoint==VK_PIPELINE_BIND_POINT_GRAPHICS)
@@ -6418,7 +6450,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer buffer, uint
     const auto applicationError=GetLastError();
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdDispatch) return;
-    if(srSdkDepth){state->cmdDispatch(buffer,x,y,z);return;}
+    if(srSdkDepth){state->cmdDispatch(srCommand(state,buffer),x,y,z);return;}
     srTailCommand(state,buffer,[&]{return srTailSimple(stc::Kind::Dispatch,{x,y,z},stc::Api::Core);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Dispatch, trackingStarted);
     const auto recording = xess_vk::render_pass_observer::dispatchPoint(state->renderPass,buffer);
@@ -6438,7 +6470,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer buffer, uint
     if(state->srRuntime&&srTicket)state->srRuntime->prepare(recording,*srTicket);
     const bool suppressed=srInterceptDispatch(state,recording,srEvidence,srTicket?*srTicket:xess_vk::sr_observation::DispatchTicket{},true);
     const auto srGpuTicket=suppressed?SrGpuWrite{}:srGpuBeforeDispatch(state,recording,srTicket);
-    if(!suppressed)tracking.driver([&] { return state->cmdDispatch(buffer, x, y, z); });
+    if(!suppressed)tracking.driver([&] { return state->cmdDispatch(srCommand(state,buffer), x, y, z); });
     const auto originalError=suppressed?applicationError:GetLastError();
     if(state->srRuntime)state->srRuntime->replacementFullWriteReturned(recording,!suppressed);
     srGpuAfterDispatch(state,srGpuTicket);
@@ -6454,7 +6486,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer buff
     const auto applicationError=GetLastError();
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdDispatchIndirect) return;
-    if(srSdkDepth){state->cmdDispatchIndirect(buffer,indirect,offset);return;}
+    if(srSdkDepth){state->cmdDispatchIndirect(srCommand(state,buffer),indirect,offset);return;}
     srTailCommand(state,buffer,[&]{return srTailSimple(stc::Kind::DispatchIndirect,{bits(indirect),offset},stc::Api::Core);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Dispatch, trackingStarted);
     const auto recording = xess_vk::render_pass_observer::dispatchPoint(state->renderPass,buffer);
@@ -6473,7 +6505,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer buff
     if(state->srRuntime&&srTicket)state->srRuntime->prepare(recording,*srTicket);
     const bool suppressed=srInterceptDispatch(state,recording,srEvidence,srTicket?*srTicket:xess_vk::sr_observation::DispatchTicket{},false);
     const auto srGpuTicket=suppressed?SrGpuWrite{}:srGpuBeforeDispatch(state,recording,srTicket);
-    if(!suppressed)tracking.driver([&] { return state->cmdDispatchIndirect(buffer, indirect, offset); });
+    if(!suppressed)tracking.driver([&] { return state->cmdDispatchIndirect(srCommand(state,buffer), indirect, offset); });
     const auto originalError=suppressed?applicationError:GetLastError();
     if(state->srRuntime)state->srRuntime->replacementFullWriteReturned(recording,!suppressed);
     srGpuAfterDispatch(state,srGpuTicket);
@@ -6490,7 +6522,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBase(VkCommandBuffer buffer, 
     const auto applicationError=GetLastError();
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdDispatchBase) return;
-    if(srSdkDepth){state->cmdDispatchBase(buffer,baseX,baseY,baseZ,x,y,z);return;}
+    if(srSdkDepth){state->cmdDispatchBase(srCommand(state,buffer),baseX,baseY,baseZ,x,y,z);return;}
     srTailCommand(state,buffer,[&]{return srTailSimple(stc::Kind::DispatchBase,{baseX,baseY,baseZ,x,y,z},stc::Api::Core);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Dispatch, trackingStarted);
     const auto recording = xess_vk::render_pass_observer::dispatchPoint(state->renderPass,buffer);
@@ -6510,7 +6542,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBase(VkCommandBuffer buffer, 
     if(state->srRuntime&&srTicket)state->srRuntime->prepare(recording,*srTicket);
     const bool suppressed=srInterceptDispatch(state,recording,srEvidence,srTicket?*srTicket:xess_vk::sr_observation::DispatchTicket{},baseX==0&&baseY==0&&baseZ==0);
     const auto srGpuTicket=suppressed?SrGpuWrite{}:srGpuBeforeDispatch(state,recording,srTicket);
-    if(!suppressed)tracking.driver([&] { return state->cmdDispatchBase(buffer, baseX, baseY, baseZ, x, y, z); });
+    if(!suppressed)tracking.driver([&] { return state->cmdDispatchBase(srCommand(state,buffer), baseX, baseY, baseZ, x, y, z); });
     const auto originalError=suppressed?applicationError:GetLastError();
     if(state->srRuntime)state->srRuntime->replacementFullWriteReturned(recording,!suppressed);
     srGpuAfterDispatch(state,srGpuTicket);
@@ -6528,7 +6560,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBaseKHR(VkCommandBuffer buffe
     const auto applicationError=GetLastError();
     const auto trackingStarted = trackingCpuStart();
     auto* state = findDevice(buffer); if (!state || !state->cmdDispatchBaseKhr) return;
-    if(srSdkDepth){state->cmdDispatchBaseKhr(buffer,baseX,baseY,baseZ,x,y,z);return;}
+    if(srSdkDepth){state->cmdDispatchBaseKhr(srCommand(state,buffer),baseX,baseY,baseZ,x,y,z);return;}
     srTailCommand(state,buffer,[&]{return srTailSimple(stc::Kind::DispatchBase,{baseX,baseY,baseZ,x,y,z},stc::Api::Khr);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Dispatch, trackingStarted);
     const auto recording = xess_vk::render_pass_observer::dispatchPoint(state->renderPass,buffer);
@@ -6548,7 +6580,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBaseKHR(VkCommandBuffer buffe
     if(state->srRuntime&&srTicket)state->srRuntime->prepare(recording,*srTicket);
     const bool suppressed=srInterceptDispatch(state,recording,srEvidence,srTicket?*srTicket:xess_vk::sr_observation::DispatchTicket{},baseX==0&&baseY==0&&baseZ==0);
     const auto srGpuTicket=suppressed?SrGpuWrite{}:srGpuBeforeDispatch(state,recording,srTicket);
-    if(!suppressed)tracking.driver([&] { return state->cmdDispatchBaseKhr(buffer, baseX, baseY, baseZ, x, y, z); });
+    if(!suppressed)tracking.driver([&] { return state->cmdDispatchBaseKhr(srCommand(state,buffer), baseX, baseY, baseZ, x, y, z); });
     const auto originalError=suppressed?applicationError:GetLastError();
     if(state->srRuntime)state->srRuntime->replacementFullWriteReturned(recording,!suppressed);
     srGpuAfterDispatch(state,srGpuTicket);
@@ -6565,31 +6597,31 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBaseKHR(VkCommandBuffer buffe
 #define SR_TAIL_FORWARD(NAME,MEMBER,PARAMETERS,ARGUMENTS,SNAPSHOT) \
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL NAME PARAMETERS { \
     auto* state=findDevice(buffer);if(!state||!state->MEMBER)return; \
-    if(srSdkDepth){state->MEMBER ARGUMENTS;return;} \
+    if(srSdkDepth){buffer=srCommand(state,buffer);state->MEMBER ARGUMENTS;return;} \
     if constexpr(std::string_view(#NAME)=="vkCmdDrawIndirectCount"||std::string_view(#NAME)=="vkCmdDrawIndirectCountKHR"||std::string_view(#NAME)=="vkCmdDrawIndexedIndirectCount"||std::string_view(#NAME)=="vkCmdDrawIndexedIndirectCountKHR") \
         if(srProductDraw(state,buffer,std::string_view(#NAME).find("Indexed")!=std::string_view::npos?stc::Kind::DrawIndexedIndirectCount:stc::Kind::DrawIndirectCount))return; \
     if(srTailCommand(state,buffer,[&]{return SNAPSHOT;}))return; \
-    state->MEMBER ARGUMENTS; \
+    buffer=srCommand(state,buffer);state->MEMBER ARGUMENTS; \
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer buffer,VkPipelineLayout layout,VkShaderStageFlags stages,uint32_t offset,uint32_t size,const void* values) {
     auto* state=findDevice(buffer);if(!state||!state->cmdPushConstants)return;
-    if(srSdkDepth){state->cmdPushConstants(buffer,layout,stages,offset,size,values);return;}
+    if(srSdkDepth){state->cmdPushConstants(srCommand(state,buffer),layout,stages,offset,size,values);return;}
     // push() only tracks compute stages; skip the facts query for graphics-only pushes.
     if(state->srRuntime&&(stages&VK_SHADER_STAGE_COMPUTE_BIT))state->srRuntime->push(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer),stages);
     srTailCommand(state,buffer,[&]{return stc::pushConstants(layout,stages,offset,size,values);});
-    state->cmdPushConstants(buffer,layout,stages,offset,size,values);
+    state->cmdPushConstants(srCommand(state,buffer),layout,stages,offset,size,values);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants2(VkCommandBuffer buffer,const VkPushConstantsInfo* info) {
     auto* state=findDevice(buffer);if(!state||!state->cmdPushConstants2)return;
-    if(srSdkDepth){state->cmdPushConstants2(buffer,info);return;}
+    if(srSdkDepth){state->cmdPushConstants2(srCommand(state,buffer),info);return;}
     if(state->srRuntime&&info&&(info->stageFlags&VK_SHADER_STAGE_COMPUTE_BIT))state->srRuntime->push(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer),info->stageFlags);
-    srTailCommand(state,buffer,[&]{return stc::pushConstants2(info);});state->cmdPushConstants2(buffer,info);
+    srTailCommand(state,buffer,[&]{return stc::pushConstants2(info);});state->cmdPushConstants2(srCommand(state,buffer),info);
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants2KHR(VkCommandBuffer buffer,const VkPushConstantsInfo* info) {
     auto* state=findDevice(buffer);if(!state||!state->cmdPushConstants2Khr)return;
-    if(srSdkDepth){state->cmdPushConstants2Khr(buffer,info);return;}
+    if(srSdkDepth){state->cmdPushConstants2Khr(srCommand(state,buffer),info);return;}
     if(state->srRuntime&&info&&(info->stageFlags&VK_SHADER_STAGE_COMPUTE_BIT))state->srRuntime->push(xess_vk::render_pass_observer::recordingFacts(state->renderPass,buffer),info->stageFlags);
-    srTailCommand(state,buffer,[&]{return stc::pushConstants2(info);});state->cmdPushConstants2Khr(buffer,info);
+    srTailCommand(state,buffer,[&]{return stc::pushConstants2(info);});state->cmdPushConstants2Khr(srCommand(state,buffer),info);
 }
 SR_TAIL_FORWARD(vkCmdSetViewport,cmdSetViewport,(VkCommandBuffer buffer,uint32_t first,uint32_t count,const VkViewport* views),(buffer,first,count,views),(srTailViewport("vkCmdSetViewport",first,count,views)))
 SR_TAIL_FORWARD(vkCmdSetScissor,cmdSetScissor,(VkCommandBuffer buffer,uint32_t first,uint32_t count,const VkRect2D* rects),(buffer,first,count,rects),(srTailScissor("vkCmdSetScissor",first,count,rects)))
@@ -6624,10 +6656,10 @@ SR_TAIL_FORWARD(vkCmdCopyBuffer,cmdCopyBuffer,(VkCommandBuffer buffer,VkBuffer s
 #define SR_IMAGE_FORWARD(NAME,MEMBER,PARAMETERS,ARGUMENTS,FIRST,SECOND,KIND) \
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL NAME PARAMETERS { \
     auto* state=findDevice(buffer);if(!state||!state->MEMBER)return; \
-    if(srSdkDepth){state->MEMBER ARGUMENTS;return;} \
+    if(srSdkDepth){buffer=srCommand(state,buffer);state->MEMBER ARGUMENTS;return;} \
     srImageTouch(state,buffer,FIRST,KIND);if(SECOND)srImageTouch(state,buffer,SECOND,KIND); \
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther(#NAME,{bits(FIRST),bits(SECOND)});snapshot.truncated=true;return snapshot;}); \
-    state->MEMBER ARGUMENTS; \
+    buffer=srCommand(state,buffer);state->MEMBER ARGUMENTS; \
 }
 SR_IMAGE_FORWARD(vkCmdCopyBufferToImage,cmdCopyBufferToImage,
     (VkCommandBuffer buffer,VkBuffer source,VkImage destination,VkImageLayout layout,uint32_t count,const VkBufferImageCopy* regions),
@@ -6657,11 +6689,11 @@ SR_IMAGE_FORWARD(vkCmdCopyImageToBuffer2KHR,cmdCopyImageToBuffer2Khr,(VkCommandB
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer buffer,VkImage image,VkImageLayout layout,
     const VkClearColorValue* value,uint32_t count,const VkImageSubresourceRange* ranges) {
     auto* state=findDevice(buffer);if(!state||!state->cmdClearColorImage)return;
-    if(srSdkDepth){state->cmdClearColorImage(buffer,image,layout,value,count,ranges);return;}
+    if(srSdkDepth){state->cmdClearColorImage(srCommand(state,buffer),image,layout,value,count,ranges);return;}
     const bool discard=state->srRuntime&&state->srRuntime->replacementFullClear(image,count,ranges);
     srImageTouch(state,buffer,image,xess_vk::RecordedImageTouch::Clear,discard);
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdClearColorImage",{bits(image),0});snapshot.truncated=true;return snapshot;});
-    state->cmdClearColorImage(buffer,image,layout,value,count,ranges);
+    state->cmdClearColorImage(srCommand(state,buffer),image,layout,value,count,ranges);
 }
 // Ordinary descriptor evidence. Original Vulkan calls are always made exactly
 // once, with unchanged arguments and no metadata lock held across the driver.
@@ -6764,11 +6796,11 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer bu
     uint32_t first,uint32_t count,const VkDescriptorSet* sets,uint32_t dynamicCount,const uint32_t* offsets) {
     const auto trackingStarted = trackingCpuStart();
     auto* state=findDevice(buffer); if(!state || !state->cmdBindDescriptorSets) return;
-    if(srSdkDepth){state->cmdBindDescriptorSets(buffer,point,layout,first,count,sets,dynamicCount,offsets);return;}
+    if(srSdkDepth){state->cmdBindDescriptorSets(srCommand(state,buffer),point,layout,first,count,sets,dynamicCount,offsets);return;}
     srProductBind(state,buffer,point,layout,first,count,sets,dynamicCount,offsets);
     srTailCommand(state,buffer,[&]{return stc::bindDescriptorSets(point,layout,first,count,sets,dynamicCount,offsets);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
-    tracking.driver([&] { return state->cmdBindDescriptorSets(buffer,point,layout,first,count,sets,dynamicCount,offsets); });
+    tracking.driver([&] { return state->cmdBindDescriptorSets(srCommand(state,buffer),point,layout,first,count,sets,dynamicCount,offsets); });
     xess_vk::descriptor_image_observer::bindSets(state->descriptors,buffer,point,layout,first,count,sets,dynamicCount,offsets);
     if constexpr(researchDiagnostics) if(state->renderTail&&state->renderTail->active()&&point==VK_PIPELINE_BIND_POINT_GRAPHICS) {
         std::array<std::uint64_t,xess_vk::descriptor_image_metadata::maxBoundSets> copied{};
@@ -6831,7 +6863,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet(VkCommandBuffer buf
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSet",{point,bits(layout),set,count});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(point==VK_PIPELINE_BIND_POINT_COMPUTE) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSet(buffer,point, layout, set, count, writes); });
+    tracking.driver([&] { return state->cmdPushDescriptorSet(srCommand(state,buffer),point, layout, set, count, writes); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate(VkCommandBuffer buffer,VkDescriptorUpdateTemplate update, VkPipelineLayout layout, uint32_t set, const void* data) {
     const auto trackingStarted = trackingCpuStart();
@@ -6839,17 +6871,17 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate(VkComma
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSetWithTemplate",{bits(update),bits(layout),set});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate(buffer,update, layout, set, data); });
+    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate(srCommand(state,buffer),update, layout, set, data); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets2(VkCommandBuffer buffer,const VkBindDescriptorSetsInfo* info) {
     const auto trackingStarted = trackingCpuStart();
     auto* state=findDevice(buffer); if(!state || !state->cmdBindDescriptorSets2) return;
-    if(srSdkDepth){state->cmdBindDescriptorSets2(buffer,info);return;}
+    if(srSdkDepth){state->cmdBindDescriptorSets2(srCommand(state,buffer),info);return;}
     srProductCommand(state,buffer,[&]{return stc::bindDescriptorSets2(info);});
     srTailCommand(state,buffer,[&]{return stc::bindDescriptorSets2(info);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(!descriptorStagesGraphicsOnly(info,VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO)) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdBindDescriptorSets2(buffer,info); });
+    tracking.driver([&] { return state->cmdBindDescriptorSets2(srCommand(state,buffer),info); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet2(VkCommandBuffer buffer,const VkPushDescriptorSetInfo* info) {
     const auto trackingStarted = trackingCpuStart();
@@ -6857,7 +6889,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet2(VkCommandBuffer bu
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSet2",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(!descriptorStagesGraphicsOnly(info,VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO)) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSet2(buffer,info); });
+    tracking.driver([&] { return state->cmdPushDescriptorSet2(srCommand(state,buffer),info); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2(VkCommandBuffer buffer,const VkPushDescriptorSetWithTemplateInfo* info) {
     const auto trackingStarted = trackingCpuStart();
@@ -6865,7 +6897,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2(VkComm
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSetWithTemplate2",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate2(buffer,info); });
+    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate2(srCommand(state,buffer),info); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer buffer,VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t set, uint32_t count, const VkWriteDescriptorSet* writes) {
     const auto trackingStarted = trackingCpuStart();
@@ -6873,7 +6905,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer 
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSetKHR",{point,bits(layout),set,count});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(point==VK_PIPELINE_BIND_POINT_COMPUTE) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSetKHR(buffer,point, layout, set, count, writes); });
+    tracking.driver([&] { return state->cmdPushDescriptorSetKHR(srCommand(state,buffer),point, layout, set, count, writes); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer buffer,VkDescriptorUpdateTemplate update, VkPipelineLayout layout, uint32_t set, const void* data) {
     const auto trackingStarted = trackingCpuStart();
@@ -6881,17 +6913,17 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkCo
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSetWithTemplateKHR",{bits(update),bits(layout),set});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplateKHR(buffer,update, layout, set, data); });
+    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplateKHR(srCommand(state,buffer),update, layout, set, data); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets2KHR(VkCommandBuffer buffer,const VkBindDescriptorSetsInfo* info) {
     const auto trackingStarted = trackingCpuStart();
     auto* state=findDevice(buffer); if(!state || !state->cmdBindDescriptorSets2KHR) return;
-    if(srSdkDepth){state->cmdBindDescriptorSets2KHR(buffer,info);return;}
+    if(srSdkDepth){state->cmdBindDescriptorSets2KHR(srCommand(state,buffer),info);return;}
     srProductCommand(state,buffer,[&]{return stc::bindDescriptorSets2(info,stc::Api::Khr2);});
     srTailCommand(state,buffer,[&]{return stc::bindDescriptorSets2(info,stc::Api::Khr2);});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(!descriptorStagesGraphicsOnly(info,VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO)) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdBindDescriptorSets2KHR(buffer,info); });
+    tracking.driver([&] { return state->cmdBindDescriptorSets2KHR(srCommand(state,buffer),info); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet2KHR(VkCommandBuffer buffer,const VkPushDescriptorSetInfo* info) {
     const auto trackingStarted = trackingCpuStart();
@@ -6899,7 +6931,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet2KHR(VkCommandBuffer
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSet2KHR",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     if(!descriptorStagesGraphicsOnly(info,VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO)) xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSet2KHR(buffer,info); });
+    tracking.driver([&] { return state->cmdPushDescriptorSet2KHR(srCommand(state,buffer),info); });
 }
 OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2KHR(VkCommandBuffer buffer,const VkPushDescriptorSetWithTemplateInfo* info) {
     const auto trackingStarted = trackingCpuStart();
@@ -6907,7 +6939,7 @@ OBS_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2KHR(VkC
     srTailCommand(state,buffer,[&]{auto snapshot=srTailOther("vkCmdPushDescriptorSetWithTemplate2KHR",{});snapshot.truncated=true;return snapshot;});
     TrackingCpuScope tracking(state, TrackingCpuGroup::Bind, trackingStarted);
     xess_vk::descriptor_image_observer::commandUnsupported(state->descriptors,buffer);
-    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate2KHR(buffer,info); });
+    tracking.driver([&] { return state->cmdPushDescriptorSetWithTemplate2KHR(srCommand(state,buffer),info); });
 }
 namespace {
 PFN_vkVoidFunction instanceHook(const char* name) noexcept {
@@ -7123,6 +7155,8 @@ PFN_vkVoidFunction deviceHook(const char* name) noexcept {
 }
 }
 
+#include "fsr4_command_forwarders.inc"
+
 OBS_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* name) {
     if (!name) return nullptr;
     // The loader queries these while constructing the chain, including with a
@@ -7142,6 +7176,7 @@ OBS_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInst
     if (!downstream) return nullptr;
     if(state->srSdkPrivate&&std::strcmp(name,"vkCreateDevice")&&std::strcmp(name,"vkDestroyDevice")&&std::strcmp(name,"vkDestroyInstance"))return downstream;
     if (const auto hook = instanceHook(name)) return hook;
+    if(const auto continuation=fsr4AdditionalCommandHook(name))return continuation;
     return downstream;
 }
 OBS_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* name) {
@@ -7152,6 +7187,7 @@ OBS_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice
     const auto downstream = state->gdpa(device, name); if (!downstream) return nullptr;
     if(state->srSdkPrivate&&std::strcmp(name,"vkDestroyDevice"))return downstream;
     if (const auto hook = deviceHook(name)) return hook;
+    if(const auto continuation=fsr4AdditionalCommandHook(name))return continuation;
     return downstream;
 }
 OBS_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_layerGetPhysicalDeviceProcAddr(VkInstance instance, const char* name) {

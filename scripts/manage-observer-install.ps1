@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('ReviewPlan', 'Install', 'Status', 'SetGamePath', 'Launch', 'LaunchMod', 'Smoke', 'Uninstall', 'RetentionPlan', 'SetRetentionPolicy')][string]$Action = 'ReviewPlan',
     [string]$SourceDirectory,
@@ -25,6 +25,7 @@ param(
     [switch]$PresentationOff,
     [switch]$XeFG,
     [switch]$XessSr,
+    [ValidateSet('XeSS','Fsr4XmxLite')][string]$SrBackend='XeSS',
     [switch]$DisableNoDither,
     [switch]$TraceRenderTail,
     [switch]$WsiAcquireTrace,
@@ -91,6 +92,20 @@ $modOwnedNames = @('EndfieldXeSSLauncher.exe', 'EFU.exe', 'EFU-LICENSE.txt', 'EF
 $legacySdkOwnedNames = @('libxess_fg.dll', 'libxell.dll', 'LICENSE.txt')
 $sdkOwnedNames = @('libxess_fg.dll', 'libxell.dll', 'LICENSE.txt', 'libxess.dll')
 $xessSrDllSha256 = '251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7'
+$fsr4XmxDllSha256 = '74d18f09285150fa5531d1e5ffbad6a21b677e4eb1bc34cb580b2963f560e740'
+$fsr4OriginalDllSha256 = 'c33a287f3048bf02311cae430b6a977500b94ca7b315cd7bff751e6b03e483e3'
+$fsr4OwnedNames = @('amd_fidelityfx_upscaler_dx12.dll','fsr-original.dll')
+$fsr4PayloadAvailable = $false
+if ($WithXeFGSdk -and $ModPayloadDirectory) {
+    $fsr4Present = @($fsr4OwnedNames | ForEach-Object { Test-Path -LiteralPath (Join-Path $ModPayloadDirectory $_) -PathType Leaf })
+    if ($fsr4Present[0] -ne $fsr4Present[1]) { throw 'FSR4 XMX needs both the upscaler and original-weights DLLs.' }
+    $fsr4PayloadAvailable = $fsr4Present[0]
+}
+function Get-SdkFileMapping([bool]$WithFsr4) {
+    $mapping = [ordered]@{ 'libxess_fg.dll'='xeFGDllSha256'; 'libxell.dll'='xellDllSha256'; 'LICENSE.txt'='intelLicenseSha256'; 'libxess.dll'='xessSrDllSha256' }
+    if ($WithFsr4) { $mapping['amd_fidelityfx_upscaler_dx12.dll']='fsr4XmxDllSha256'; $mapping['fsr-original.dll']='fsr4OriginalDllSha256' }
+    return $mapping
+}
 $sdkVersion = '3.0.2'
 $xeFGDllSha256 = 'ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27'
 $xellDllSha256 = 'd2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7'
@@ -98,6 +113,7 @@ $intelLicenseSha256 = '784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7e
 $ownedNames = @($baseOwnedNames)
 if ($WithModLauncher) { $ownedNames += $modOwnedNames }
 if ($WithXeFGSdk) { $ownedNames += $sdkOwnedNames }
+if ($fsr4PayloadAvailable) { $ownedNames += $fsr4OwnedNames }
 $efuSha256 = '65d34a67ae1e82b03e22ea7f38baffd5d75bcf5706a4f896e4633b55e2597e94'
 $previousDitherEfuSha256 = '2ef1cd8066c62ebe42b41d098dfe8c36a559e5845626f7e6d98ddd78f4dd21fa'
 $previousPreviewEfuSha256 = 'fe27f71582726fb21cb51076a9ed3e16c6c6eae32588364daff3c5a8078d24f9'
@@ -261,6 +277,10 @@ function Get-ReceiptOwnedNames($Receipt) {
             if ($sdk.sourceHashes.xessSrDllSha256 -cne $xessSrDllSha256) { throw 'Unreviewed XeSS SR SDK pin.' }
             $names += 'libxess.dll'
         }
+        if ($null -ne $sdk.sourceHashes.fsr4XmxDllSha256) {
+            if ($sdk.sourceHashes.fsr4XmxDllSha256 -cne $fsr4XmxDllSha256 -or $sdk.sourceHashes.fsr4OriginalDllSha256 -cne $fsr4OriginalDllSha256) { throw 'Unreviewed FSR4 XMX payload pin.' }
+            $names += $fsr4OwnedNames
+        }
     }
     if (@($Receipt.files).Count -ne $names.Count) { throw 'Unexpected owned-file receipt.' }
     foreach ($name in $names) {
@@ -275,7 +295,7 @@ function Get-ReceiptOwnedNames($Receipt) {
         }
     }
     if ($null -ne $Receipt.xeFGSdk) {
-        $mapping = [ordered]@{ 'libxess_fg.dll'='xeFGDllSha256'; 'libxell.dll'='xellDllSha256'; 'LICENSE.txt'='intelLicenseSha256'; 'libxess.dll'='xessSrDllSha256' }
+        $mapping = Get-SdkFileMapping ($null -ne $Receipt.xeFGSdk.sourceHashes.fsr4XmxDllSha256)
         foreach ($name in $mapping.Keys) {
             if ($name -ceq 'libxess.dll' -and $null -eq $Receipt.xeFGSdk.sourceHashes.xessSrDllSha256) { continue }
             $entry = @($Receipt.files | Where-Object name -CEQ $name)[0]
@@ -455,6 +475,8 @@ function Set-ContinuousOffEnvironment($StartInfo, [string]$Session, [bool]$Trace
     if ($FakeSwapchain) { $settings['XESS_FAKE_SWAPCHAIN'] = '1' }
     if ($GpuTimestamps) { $settings['XESS_GPU_TIMESTAMPS'] = '1' }
     if ($XessSr) { $settings['XESS_SR_REPLACE'] = '1' }
+    if ($SrBackend -ceq 'Fsr4XmxLite' -and -not $XessSr) { throw 'FSR4 XMX requires SR replacement.' }
+    if ($XessSr) { $settings['XESS_SR_BACKEND'] = if ($SrBackend -ceq 'Fsr4XmxLite') { 'fsr4_xmx_lite' } else { 'xess' } }
     if ($TrackingCpuTiming) { $settings['XESS_TRACKING_CPU_TIMING'] = '1' }
     if ($ThreadCpuSampling) { $settings['XESS_THREAD_CPU_SAMPLING'] = '1' }
     if ($Override30Fps) { $settings['XESS_FRAME_CAP_OVERRIDE'] = '1'; $settings['XESS_FRAME_CAP_TARGET_FPS'] = [string]$FrameCapTargetFps }
@@ -589,6 +611,7 @@ function New-DiagnosticSession {
 }
 function Set-ObserverChildEnvironment($StartInfo, [string]$Session) {
     $StartInfo.EnvironmentVariables.Remove('XESS_SR_REPLACE')
+    $StartInfo.EnvironmentVariables.Remove('XESS_SR_BACKEND')
     foreach ($name in @('VK_LAYER_PATH','VK_ADD_LAYER_PATH','VK_IMPLICIT_LAYER_PATH','VK_ADD_IMPLICIT_LAYER_PATH','VK_LOADER_LAYERS_ENABLE','VK_LOADER_LAYERS_DISABLE','VK_LOADER_LAYERS_ALLOW','XESS_SL_OBSERVER','XESS_BRIDGE_DEVICE','XESS_COMPUTE_OBSERVER','XESS_FSR_OBSERVER','XESS_FSR_UPSCALE_OBSERVER','XESS_RAWCOLOR_CAPTURE','XESS_PRESENTATION_OFF','XESS_CONTINUOUS_INPUTS','XESS_FSR_NATIVE_OFF','XESS_SDK_BIN','XESS_XEFG_LOW_RES_OUTPUT','XESS_WSI_ACQUIRE_OBSERVER','XESS_FAKE_SWAPCHAIN','XESS_GPU_TIMESTAMPS','XESS_TRACKING_CPU_TIMING','XESS_THREAD_CPU_SAMPLING','XESS_FRAME_CAP_30_TO_40','XESS_FRAME_CAP_OVERRIDE','XESS_FRAME_CAP_TARGET_FPS','XESS_FG_DEBUG_MODE','XESS_FG_SCENE_THRESHOLD','XESS_RUNTIME_STATUS','XESS_RUNTIME_IMAGE','XESS_DIAGNOSTIC_MODE','XESS_WSI_EXPECT_OBSERVER','XESS_WSI_EXPECT_DIAGNOSTICS')) {
         $StartInfo.EnvironmentVariables.Remove($name)
     }
@@ -638,7 +661,8 @@ if ($Action -in @('ReviewPlan', 'Install')) {
             noticeSha256 = Get-Sha256 $modSourceFiles['EFU-SOURCE-NOTICE.txt'] }
         if ($WithXeFGSdk) {
             $sdkHashes = [ordered]@{ xeFGDllSha256=$xeFGDllSha256; xellDllSha256=$xellDllSha256; intelLicenseSha256=$intelLicenseSha256; xessSrDllSha256=$xessSrDllSha256 }
-            $mapping = [ordered]@{ 'libxess_fg.dll'='xeFGDllSha256'; 'libxell.dll'='xellDllSha256'; 'LICENSE.txt'='intelLicenseSha256'; 'libxess.dll'='xessSrDllSha256' }
+            if ($fsr4PayloadAvailable) { $sdkHashes['fsr4XmxDllSha256']=$fsr4XmxDllSha256; $sdkHashes['fsr4OriginalDllSha256']=$fsr4OriginalDllSha256 }
+            $mapping = Get-SdkFileMapping $fsr4PayloadAvailable
             foreach ($name in $mapping.Keys) {
                 $modSourceFiles[$name] = Join-Path $ModPayloadDirectory $name
                 if ((Get-Sha256 $modSourceFiles[$name]) -cne $sdkHashes.($mapping[$name])) { throw "SDK payload does not match the reviewed 3.0.2 pin: $name" }
@@ -740,7 +764,7 @@ if ($Action -eq 'Install' -and $WithXeFGSdk) {
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
-    $parameters = @{ Action = $Action; LauncherPath = $LauncherPath; GameDirectory = $GameDirectory; SessionId = $SessionId; TraceStreamline = [bool]$TraceStreamline; BridgeDevice = [bool]$BridgeDevice; TraceCompute = [bool]$TraceCompute; TraceFsr = [bool]$TraceFsr; TraceFsrUpscale = [bool]$TraceFsrUpscale; CaptureRawColor = [bool]$CaptureRawColor; PresentationOff = [bool]$PresentationOff; XeFG = [bool]$XeFG; XessSr = [bool]$XessSr; DisableNoDither = [bool]$DisableNoDither; TraceRenderTail = [bool]$TraceRenderTail; WsiAcquireTrace = [bool]$WsiAcquireTrace; FakeSwapchain = [bool]$FakeSwapchain; GpuTimestamps = [bool]$GpuTimestamps; TrackingCpuTiming = [bool]$TrackingCpuTiming; ThreadCpuSampling = [bool]$ThreadCpuSampling; LowResOutput = [bool]$LowResOutput; OfficialFallback = [bool]$OfficialFallback; ObserveInputs = [bool]$ObserveInputs; Override30Fps=[bool]$Override30Fps;FrameCapTargetFps=$FrameCapTargetFps;FgDebugMode=$FgDebugMode;FgSceneIndex=$FgSceneIndex;ReleaseMinimal=[bool]$ReleaseMinimal;DiagnosticMode=[bool]$DiagnosticMode;ReleaseSessionRetention=[bool]$ReleaseSessionRetention;SessionRetentionMode=$SessionRetentionMode;RecorderCaptureRoots=@($RecorderCaptureRoots);ApproveRetention=[bool]$ApproveRetention }
+    $parameters = @{ Action = $Action; LauncherPath = $LauncherPath; GameDirectory = $GameDirectory; SessionId = $SessionId; TraceStreamline = [bool]$TraceStreamline; BridgeDevice = [bool]$BridgeDevice; TraceCompute = [bool]$TraceCompute; TraceFsr = [bool]$TraceFsr; TraceFsrUpscale = [bool]$TraceFsrUpscale; CaptureRawColor = [bool]$CaptureRawColor; PresentationOff = [bool]$PresentationOff; XeFG = [bool]$XeFG; XessSr = [bool]$XessSr; SrBackend = $SrBackend; DisableNoDither = [bool]$DisableNoDither; TraceRenderTail = [bool]$TraceRenderTail; WsiAcquireTrace = [bool]$WsiAcquireTrace; FakeSwapchain = [bool]$FakeSwapchain; GpuTimestamps = [bool]$GpuTimestamps; TrackingCpuTiming = [bool]$TrackingCpuTiming; ThreadCpuSampling = [bool]$ThreadCpuSampling; LowResOutput = [bool]$LowResOutput; OfficialFallback = [bool]$OfficialFallback; ObserveInputs = [bool]$ObserveInputs; Override30Fps=[bool]$Override30Fps;FrameCapTargetFps=$FrameCapTargetFps;FgDebugMode=$FgDebugMode;FgSceneIndex=$FgSceneIndex;ReleaseMinimal=[bool]$ReleaseMinimal;DiagnosticMode=[bool]$DiagnosticMode;ReleaseSessionRetention=[bool]$ReleaseSessionRetention;SessionRetentionMode=$SessionRetentionMode;RecorderCaptureRoots=@($RecorderCaptureRoots);ApproveRetention=[bool]$ApproveRetention }
     if ($Action -eq 'Install') {
         $parameters['SourceDirectory'] = $SourceDirectory
         $parameters['ExpectedDllSha256'] = $ExpectedDllSha256; $parameters['ExpectedManifestSha256'] = $ExpectedManifestSha256
@@ -883,7 +907,7 @@ if ($Action -eq 'Install') {
             }
         }
         if ($WithXeFGSdk) {
-            $mapping = [ordered]@{ 'libxess_fg.dll'='xeFGDllSha256'; 'libxell.dll'='xellDllSha256'; 'LICENSE.txt'='intelLicenseSha256'; 'libxess.dll'='xessSrDllSha256' }
+            $mapping = Get-SdkFileMapping $fsr4PayloadAvailable
             foreach ($name in $mapping.Keys) {
                 $destination = Join-Path $installRoot $name
                 Copy-Item -LiteralPath $modSourceFiles[$name] -Destination $destination
@@ -1107,6 +1131,7 @@ if ($Action -eq 'LaunchMod') {
         if ($XeFG -and $null -eq $receipt.xeFGSdk) { throw 'The experimental XeSS 2x candidate requires the reviewed SDK package.' }
         if ($FakeSwapchain) { Assert-SingleChainPolicy $receipt }
         if ($XessSr -and $receipt.xeFGSdk.sourceHashes.xessSrDllSha256 -cne $xessSrDllSha256) { throw 'Install the reviewed XeSS SR SDK payload before launching stage 1.' }
+        if ($SrBackend -ceq 'Fsr4XmxLite' -and ($receipt.xeFGSdk.sourceHashes.fsr4XmxDllSha256 -cne $fsr4XmxDllSha256 -or $receipt.xeFGSdk.sourceHashes.fsr4OriginalDllSha256 -cne $fsr4OriginalDllSha256)) { throw 'Install the FSR4 XMX Lite payload before selecting this backend.' }
         $specification = Get-ModLaunchSpecification $GameDirectory ([bool]$OfficialFallback) ([bool]$ObserveInputs) ([bool]$XeFG)
         Assert-NoReparse $specification.executable
         $payload = Get-Item -LiteralPath $specification.executable
@@ -1161,6 +1186,7 @@ if ($Action -eq 'LaunchMod') {
             runtimeDiagnosticLog=$runtimeLog
             environmentForChildOnly=$(if ($ObserveInputs -or $XeFG) { $observerSettings } elseif ($OfficialFallback) { [ordered]@{} } else { [ordered]@{ EFU_RUNTIME_LOG=$runtimeLog; EFU_NO_DITHER=$start.EnvironmentVariables['EFU_NO_DITHER'] } })
             xessSrRequested=[bool]$XessSr; xessSrEnabledForChild=[bool]($XessSr -and $observerSettings['XESS_SR_REPLACE'] -ceq '1')
+            srBackend=$(if($XessSr){$observerSettings['XESS_SR_BACKEND']}else{$null})
             observeInputsRequested=[bool]$ObserveInputs; explicitLayerRequested=[bool]($ObserveInputs -or $XeFG); officialLauncherStarted=$false
             renderTailDiagnosticRequested=[bool]$TraceRenderTail
             renderTailDiagnosticEnabledForChild=[bool]($XeFG -and $observerSettings['XESS_RENDER_TAIL_DIAGNOSTIC'] -ceq '1')

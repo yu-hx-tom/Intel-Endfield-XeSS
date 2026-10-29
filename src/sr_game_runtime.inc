@@ -18,6 +18,8 @@ struct GameSrRuntime {
     const char* lastIssueReason{"none"};
     const char* recoveryBlocked{"none"};
     std::uint64_t issueFrame{},successfulRecoveries{},lastRecoveryFrame{};
+    std::uint64_t backendDiagnosticAt{};
+    sro::Status backendLastRecord{sro::Status::Disabled};xess_result_t backendLastSdkResult{XESS_RESULT_SUCCESS};
     bool sdkRestartFailed{};unsigned sdkRecoveryAttempts{};std::uint64_t restartAttemptRebuild{UINT64_MAX};
     void issue(std::uint64_t frame,const char* reason) noexcept {
         activeReason=lastIssueReason=reason;issueFrame=frame;
@@ -134,12 +136,26 @@ struct GameSrRuntime {
     }
     bool holdingOutput() noexcept {
         std::lock_guard lock(mutex);
+        const auto now=GetTickCount64();
+        if(diagnosticLoggingEnabled()&&xess_vk::sr_backend::startup()==xess_vk::sr_backend::Kind::Fsr4XmxLite&&
+           (!backendDiagnosticAt||now-backendDiagnosticAt>=2000)){
+            backendDiagnosticAt=now;JsonLine line("sr_backend_runtime");line.number("schema",1);
+            line.text("backend","fsr4_xmx_lite");line.text("model","4.1.2X Lite");line.boolean("context_ready",overlay.fsr4Bridge()&&overlay.state()==sro::State::Ready);
+            line.text("record_result",sro::name(backendLastRecord));line.number("record_sdk_result",backendLastSdkResult);line.text("backend_error",overlay.lastBackendError());
+            line.number("input_width",desired.input.width);line.number("input_height",desired.input.height);line.number("output_width",desired.output.width);line.number("output_height",desired.output.height);
+            line.number("recorded_successes",executed);line.number("submitted_frames",overlay.fsr4Bridge()?overlay.fsr4Bridge()->submittedFrames():0);
+            line.number("menu_mask_full_writes",replacementMenuMaskFullWrites);
+            line.boolean("pending_recordings",overlay.pending());line.boolean("stopped",stopped||nativeTransaction.stopped());line.boolean("output_held",holdOutput);
+            line.text("output_mode",outputMode);line.text("active_reason",activeReason);line.text("recovery_blocked",recoveryBlocked);line.text("fallback",fallbackName(fallback));line.write();
+        }
         ++presents;fallbackPresent();
         // Engine field readback alone is not proof of a new, fully rendered GPU image.
         return holdOutput;
     }
     template<class Sink> void measurementFields(Sink& line) noexcept {
-        std::lock_guard lock(mutex);line.number("sr_schema",3);line.text("sr_recording_scope","application_command_recorded_not_gpu_complete");line.boolean("sr_enabled",true);
+        std::lock_guard lock(mutex);line.number("sr_schema",4);line.text("sr_recording_scope","application_command_recorded_not_gpu_complete");line.boolean("sr_enabled",true);
+        line.text("sr_backend",xess_vk::sr_backend::name(xess_vk::sr_backend::startup()));line.text("sr_model",xess_vk::sr_backend::startup()==xess_vk::sr_backend::Kind::Fsr4XmxLite?"4.1.2X Lite":"XeSS");
+        line.number("sr_backend_submitted_frames",overlay.fsr4Bridge()?overlay.fsr4Bridge()->submittedFrames():0);
         line.text("sr_output_mode",outputMode);line.number("sr_recorded_frames",outputXess+outputTransition+outputUnavailable);
         line.number("sr_status_schema",1);line.text("sr_active_reason",activeReason);
         line.text("sr_state",holdOutput?"output_held":stopped||nativeTransaction.stopped()?"stopped":outputMode);
@@ -166,7 +182,7 @@ struct GameSrRuntime {
         const auto facts=xess_vk::render_pass_observer::recordingFactsCounters(device->renderPass);
         line.number("rp_facts_queries",facts.queries);
         line.number("rp_facts_lock_contended",facts.lockContended);line.number("rp_command_lookup_scans",facts.lookupScans);
-        line.number("sr_xess_recordings",outputXess);line.number("sr_transition_recordings",outputTransition);line.number("sr_unavailable_recordings",outputUnavailable);
+        line.number("sr_xess_recordings",overlay.fsr4Bridge()?0:outputXess);line.number("sr_fsr4_recordings",overlay.fsr4Bridge()?outputXess:0);line.number("sr_transition_recordings",outputTransition);line.number("sr_unavailable_recordings",outputUnavailable);
         line.number("sr_guard_suppressed_commands",guardSuppressedCommands);line.boolean("sr_output_held",holdOutput);
         line.text("sr_fallback_state",fallbackName(fallback));line.number("sr_fallback_entries",fallbackEntries);
         line.number("sr_fallback_releases",fallbackReleases);line.number("sr_fallback_returns",fallbackReturns);
@@ -241,6 +257,7 @@ struct GameSrRuntime {
     std::uint64_t applicationDispatches{},applicationForwarded{},applicationSuppressed{},unknownDispatches{};
     std::uint64_t replacementPhotoFullWrites{},replacementPhotoFullWritesSkipped{},replacementPhotoCoverageRefusals{};
     std::uint64_t replacementAuxFullWrites{},replacementAuxFullWritesSkipped{},replacementAuxCoverageRefusals{};
+    std::uint64_t replacementMenuMaskFullWrites{},replacementMenuMaskSkipped{},replacementMenuMaskRefusals{};
     std::uint64_t fullWriteRetiredWhileSuppressed{};
     struct PendingFullWrite {xess_vk::CommandRecordingFacts recording; xess_vk::descriptor_image_metadata::Key image,pipeline;
         bool auxiliary{},full{},omitted{};std::uint32_t width{},height{};std::array<std::uint32_t,3> groups{};
@@ -339,7 +356,8 @@ struct GameSrRuntime {
 #endif
     }
     void report(const char* reason,sro::Result result={}) noexcept {
-        JsonLine line("sr_runtime");line.number("schema",3);line.text("recording_scope","application_command_recorded_not_gpu_complete");line.text("output_mode",outputMode);line.text("reason",reason);line.text("result",sro::name(result.status));
+        // Explicit backend names keep new FSR4 records distinguishable from historical XeSS-only logs.
+        JsonLine line("sr_runtime");line.number("schema",4);line.text("backend",xess_vk::sr_backend::name(xess_vk::sr_backend::startup()));line.text("backend_error",overlay.lastBackendError());line.text("recording_scope","application_command_recorded_not_gpu_complete");line.text("output_mode",outputMode);line.text("reason",reason);line.text("result",sro::name(result.status));
         line.number("sdk_result",result.sdkResult);line.text("sdk_operation",overlay.lastSdkOperation());line.number("attempts",attempts);line.number("executed",executed);
         line.number("calling_thread",GetCurrentThreadId());line.number("sdk_owner_thread",ownerThread);line.number("last_executed_frame",lastFrame);
         line.number("source_skips",sourceSkips);line.number("interval_skips",intervalSkips);line.number("binding_skips",bindingSkips);
@@ -378,6 +396,17 @@ struct GameSrRuntime {
         (void)xess_vk::fsr_callback_install::ensureNativeResolution(bits(device->device));
 #endif
         std::lock_guard lock(mutex);
+        struct UpdateBridge {DeviceState* device;sro::Overlay& overlay;~UpdateBridge(){publishFsr4Bridge(device,overlay.fsr4Bridge());}} updateBridge{device,overlay};
+        // Old Unity CBs can remain allocated across settings changes even after
+        // their entire SR continuation completed. They must not pin SR sizing.
+        if(auto* bridge=overlay.fsr4Bridge())for(auto& g:guards)
+            if(g.coreOmitted&&bridge->completed(key(g.recording))){
+                g.coreOmitted=false;
+                // Retire the recording owner only. Omitted image contents stay
+                // watched until a proved overwrite/discard or native recovery.
+                nativeTransaction.retired(g.recording.command,g.recording.rpRecordingGeneration);
+            }
+        overlay.pollBackendCompletions();
         const auto rebuild=rebuildRequests.load();
         const bool needsRecovery=stopped||nativeTransaction.stopped()||xess_vk::sr_native_resolution::control.requested();
         if(rebuild!=restartAttemptRebuild){sdkRestartFailed=false;sdkRecoveryAttempts=0;restartAttemptRebuild=rebuild;}
@@ -411,6 +440,8 @@ struct GameSrRuntime {
         if(overlay.state()==sro::State::Disabled){
             sro::VulkanFunctions vk{device->cmdPipelineBarrier,device->cmdBindPipeline,device->cmdBindDescriptorSets,device->cmdPushConstants,enter,leave,this};
             vk.blit=device->cmdBlitImage;
+            vk.gipa=device->parent->gipa;vk.gdpa=device->gdpa;vk.queueFamily=device->srQueueFamily;
+            vk.physicalForInstanceDispatch=device->physical;
             // One blocking initial build avoids background compiler work racing
             // device destruction after Unity has joined its recording thread.
             result=overlay.start(sro::Enable::On,phase,identity,*device->srAdmission,desired,
@@ -484,6 +515,10 @@ struct GameSrRuntime {
         constexpr auto required=xess_vk::frame_input::Extents|xess_vk::frame_input::Jitter|xess_vk::frame_input::MotionScale|xess_vk::frame_input::Reset;
         const auto& constants=source.constants;
         if((constants.validityMask&required)!=required){reject("frame_constants",sourceSkips);return;}
+        if(xess_vk::sr_backend::startup()==xess_vk::sr_backend::Kind::Fsr4XmxLite&&
+           (!(constants.validityMask&xess_vk::frame_input::CameraPlanes)||
+            !(std::isfinite(constants.cameraNear)&&std::isfinite(constants.cameraFar)&&constants.cameraNear>0&&constants.cameraFar>constants.cameraNear)||
+            !(std::isfinite(constants.tanHalfFovHorizontal)&&constants.tanHalfFovHorizontal>0))){reject("fsr4_camera_constants",sourceSkips);return;}
         sro::Configuration config;
         config.input={std::uint32_t(constants.renderSize[0]),std::uint32_t(constants.renderSize[1])};
         config.output={std::uint32_t(constants.upscaleSize[0]),std::uint32_t(constants.upscaleSize[1])};
@@ -519,6 +554,10 @@ struct GameSrRuntime {
         restore.setCount=evidence.computeRestoreSetCount;restore.completeStaticBindings=restore.completePushConstants=true;
         for(unsigned n=0;n<restore.setCount;++n){restore.sets[n]=reinterpret_cast<VkDescriptorSet>(evidence.computeRestoreSets[n].handle);restore.setGenerations[n]=evidence.computeRestoreSets[n].generation;}
         frame.jitterX=constants.jitter[0];frame.jitterY=constants.jitter[1];frame.historyEpoch=identity.incarnation;
+        if(std::isfinite(constants.deltaSeconds)&&constants.deltaSeconds>0)frame.frameTimeMs=std::clamp(constants.deltaSeconds*1000.0f,0.001f,1000.0f);
+        if(constants.validityMask&xess_vk::frame_input::CameraPlanes){frame.cameraNear=constants.cameraNear;frame.cameraFar=constants.cameraFar;}
+        if(std::isfinite(constants.tanHalfFovHorizontal)&&constants.tanHalfFovHorizontal>0)
+            frame.cameraFov=2.0f*std::atan(constants.tanHalfFovHorizontal/(float(config.output.width)/config.output.height));
         frame.gameReset=constants.reset||!lastFrame||source.frame.engineFrame!=lastFrame+1||replacementReset;
         frame.pinnedModule=frame.sameFrameInputs=frame.domainAndDownstreamVerified=true;
         frame.finalFsrDispatchReturned=false;
@@ -547,8 +586,9 @@ struct GameSrRuntime {
             replacementExecuteCount+=result.executeSucceeded;
             if(result.fallbackRecorded){classify(source.frame.engineFrame,1);degrade(source.frame.engineFrame,"color_transition");stopped=true;xess_vk::sr_native_resolution::control.request(xess_vk::sr_native_resolution::Reason::SdkFailure);}
         }
+        backendLastRecord=result.status;backendLastSdkResult=result.sdkResult;
         if(timing&&sdkTime)timing->afterDispatch(sdkTime,result.executeSucceeded||result.status==sro::Status::SdkFailureCommandsUncertain);const auto index=static_cast<unsigned>(result.status);if(index<results.size())++results[index];
-        if(result.executeSucceeded){resumed(source.frame.engineFrame);holdOutput=false;++executed;if(device->measurements)device->measurements->increment(xess_vk::measurement::Counter::SrExecutes);classify(source.frame.engineFrame,0);outputMode="xess_replacement";lastFrame=source.frame.engineFrame;replacementReset=false;consecutiveTransitions=0;}
+        if(result.executeSucceeded){resumed(source.frame.engineFrame);holdOutput=false;++executed;if(device->measurements)device->measurements->increment(xess_vk::measurement::Counter::SrExecutes);classify(source.frame.engineFrame,0);outputMode=overlay.fsr4Bridge()?"fsr4_xmx_replacement":"xess_replacement";lastFrame=source.frame.engineFrame;replacementReset=false;consecutiveTransitions=0;}
         if(result.status==sro::Status::SdkFailure||result.status==sro::Status::SdkFailureCommandsUncertain){stopped=true;issue(source.frame.engineFrame,"sdk_execute");xess_vk::sr_native_resolution::control.request(xess_vk::sr_native_resolution::Reason::SdkFailure);}
         if(attempts<=8||attempts%300==0||(currentReplacement&&!result.executeSucceeded)||result.status==sro::Status::SdkFailureCommandsUncertain)report(ticket.containsRcas?"after_rcas":"after_accumulate",result);
     }
@@ -588,6 +628,7 @@ struct GameSrRuntime {
     }
     void idle(VkResult result) noexcept {if(srSdkDepth)return;std::lock_guard lock(mutex);(void)overlay.deviceIdle(identity,result);timingIdle=result==VK_SUCCESS;if(timing)timing->deviceIdle(result);}
     ~GameSrRuntime(){
+        publishFsr4Bridge(device,nullptr);
         std::lock_guard lock(mutex);stopped=true;
         if(overlay.hasContext()&&!overlay.pending()&&GetCurrentThreadId()==ownerThread){SrSdkScope injected;(void)overlay.stop(sro::HostPhase::OutsideApplicationRecording);}
         if(overlay.hasContext())++retainedContexts;

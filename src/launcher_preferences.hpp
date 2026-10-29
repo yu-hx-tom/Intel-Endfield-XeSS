@@ -16,6 +16,7 @@ inline constexpr wchar_t sceneThresholdPath[]=L"C:\\ProgramData\\EndfieldXeSSDia
 // Retain the old enabled marker; missing numeric preference migrates to 40.
 inline constexpr wchar_t frameCapEnabledPath[]=L"C:\\ProgramData\\EndfieldXeSSDiag\\FrameCap30To40";
 inline constexpr wchar_t frameCapTargetPath[]=L"C:\\ProgramData\\EndfieldXeSSDiag\\FrameCapTargetFps";
+inline constexpr wchar_t srBackendPath[]=L"C:\\ProgramData\\EndfieldXeSSDiag\\SrBackend";
 inline unsigned parse(std::string_view text,unsigned low,unsigned high,unsigned fallback) noexcept {
     const auto first=text.find_first_not_of(" \t\r\n"),last=text.find_last_not_of(" \t\r\n");
     if(first==std::string_view::npos||last-first>=3||(high<=9&&first!=last))return fallback;

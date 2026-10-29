@@ -1,10 +1,10 @@
 # I卡终末地xess超分+帧生成
 
-面向 Intel 显卡的《明日方舟：终末地》独立 XeSS 启动工具，提供 XeSS 超分辨率、2×／3×／4×帧生成、可选免虚化和自定义基础帧率设置。
+面向 Intel 显卡的《明日方舟：终末地》独立启动工具，提供 XeSS／FSR4 XMX Lite 超分辨率、XeSS 2×／3×／4×帧生成、可选免虚化和自定义基础帧率设置。
 
 启动器采用紧凑界面，程序、任务栏和托盘使用统一图标。同一 Windows 用户在当前会话中只保留一个启动器实例；再次启动时直接唤出已有窗口，已收起到托盘时也会恢复。
 
-**技术路径：游戏保留 Vulkan 渲染。XeSS 超分在 Vulkan 渲染流程中替换 FSR 超分核心；帧生成通过同一块显卡的共享资源，转交 D3D12／DXGI 的 XeSS FG 输出。** 因此不是把游戏整体改为 DX12，也不是仅靠画面捕获进行插帧。
+**技术路径：游戏保留 Vulkan 渲染。** XeSS 超分在 Vulkan 内执行；选择 FSR4 XMX Lite 时，通过同一块显卡的共享资源交给 D3D12 执行超分，再回到 Vulkan。帧生成使用 XeSS FG，并通过 D3D12／DXGI 输出。超分方案在启动前选择。
 
 ## 环境要求
 
@@ -40,14 +40,14 @@ winget install --id Microsoft.PowerShell --source winget --installer-type wix --
 
 ## 游戏内怎么设置
 
-- **超分：**“画质提升”选择 **AMD FSR3**，超分档位照常在游戏中选择。菜单名称保留，但放大档位背后由 XeSS 接管；建议首次使用全屏 1920×1080、平衡档。
-- **帧生成：**在游戏里开启 **FSR3 Frame Generation**，实际由 XeSS 帧生成接管；关闭该选项则关闭插帧，XeSS 超分继续运行。不要另外叠加其他插帧工具。
+- **超分：**启动器选择 XeSS 或 FSR4 XMX Lite，游戏内“画质提升”选择 **AMD FSR3**，再照常选择超分档位。放大档位由启动器选定的超分方案接管；建议首次使用全屏 1920×1080、平衡档。FSR4 需要对应的 XMX 模型文件，当前为实验功能。
+- **帧生成：**在游戏里开启 **FSR3 Frame Generation**，实际由 XeSS 帧生成接管；关闭该选项则关闭插帧，所选超分继续运行。不要另外叠加其他插帧工具。
 - **倍率：**在启动器选择 **2×、3×或4×**并保存，然后重新启动游戏。倍率不支持游戏内热切换，基础帧率乘以倍率才是目标显示帧率，实际结果受负载和显示器限制。
 - **40帧配3×：**勾选启动器里的自定义“30帧档”映射，输入 `40`，选择 `3×`并保存；下次进入游戏时，游戏内限帧选择 **30帧**，该档实际映射为40基础帧，目标约120显示帧。可输入30–120整数；游戏的60帧档不变。
 - **免虚化：**由启动器开关选择是否启用；下次启动游戏生效。
 - **其他设置：**场景切换阈值先保持默认。首次验证后再按设备性能调整分辨率、画质和倍率。
 
-登录／“点击进入游戏”页保持单帧，正式进入场景后按游戏设置启用插帧。本次修复也会在角色菜单内暂停插帧，退出菜单后自动恢复；XeSS 超分继续运行。该角色菜单识别修复已在“超分＋帧生成”路线验收，不代表单独帧生成路线的所有菜单情况已验证。
+登录／“点击进入游戏”页保持单帧，正式进入场景后按游戏设置启用插帧。本次修复也会在角色菜单内暂停插帧，退出菜单后自动恢复；所选超分继续运行。FSR4 路线已在本机验证菜单及切档；长时间稳定性、功耗和所有显卡型号尚未充分验证。
 
 ## 精简发行版与排错
 
@@ -61,6 +61,8 @@ winget install --id Microsoft.PowerShell --source winget --installer-type wix --
 
 ## 许可证与源码
 
-Intel XeSS、EFU、MinHook 等保留各自许可证与原作者署名；详见发行包内 `THIRD-PARTY-NOTICES.txt`、`licenses/` 和 EFU 对应源码目录。包内不包含游戏程序、游戏资源、官方启动器、驱动或 RTSS。第三方名称不表示官方认可。
+免虚化来自 [DynamiByte/Endfield-Uncensored](https://github.com/DynamiByte/Endfield-Uncensored)（EFU），采用 [AGPL-3.0](https://github.com/DynamiByte/Endfield-Uncensored/blob/eff32bbc89baaf25fcb25f2a8903990e172f319e/LICENSE.txt)。本项目调用基于该提交修改并独立编译的 EFU；发行包内的 `efu-corresponding-source/` 提供对应修改后源码，`mod/EFU-SOURCE-NOTICE.txt` 和 `mod/EFU-LICENSE.txt` 记录来源、修改及许可。
+
+Intel XeSS、MinHook 等保留各自许可证与原作者署名；详见发行包内 `THIRD-PARTY-NOTICES.txt` 与 `licenses/`。FSR4 XMX 模型为第三方修改版本，其再分发许可需要单独核实。第三方名称不表示官方认可。
 
 开发与构建说明见[源码构建说明](https://github.com/yu-hx-tom/Intel-Endfield-XeSS/blob/main/docs/BUILDING.md)。本项目没有承诺逐位一致的可复现构建。

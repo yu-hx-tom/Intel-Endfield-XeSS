@@ -151,7 +151,32 @@ void retire(so::Overlay& o){
     require(o.completed({recording(),h<VkQueue>(500),700,VK_SUCCESS}),"only exact successful fence completion retires SDK references");
 }
 }
-int main(){
+namespace {
+VkPhysicalDevice interopPhysicalObserved{};
+void VKAPI_PTR interopProperties(VkPhysicalDevice physical,VkPhysicalDeviceProperties2* properties){
+    interopPhysicalObserved=physical;properties->properties.vendorID=0x8086;
+    // Deliberately unavailable LUID ends the mock before any DXGI/GPU access.
+    static_cast<VkPhysicalDeviceIDProperties*>(properties->pNext)->deviceLUIDValid=VK_FALSE;
+}
+PFN_vkVoidFunction VKAPI_PTR interopInstanceProc(VkInstance instance,const char* name){
+    require(instance==identity.instance&&std::string_view(name)=="vkGetPhysicalDeviceProperties2","interop uses the expected downstream instance query");
+    return reinterpret_cast<PFN_vkVoidFunction>(interopProperties);
+}
+PFN_vkVoidFunction VKAPI_PTR interopDeviceProc(VkDevice,const char*){require(false,"LUID refusal precedes device dispatch");return nullptr;}
+}
+int main(int argc,char** argv){
+    if(argc==2&&std::string_view(argv[1])=="--fsr4-layer-handle-test"){
+        SetEnvironmentVariableW(L"XESS_SR_BACKEND",L"fsr4_xmx_lite");
+        const auto admitted=admission();auto functions=vk();functions.gipa=interopInstanceProc;functions.gdpa=interopDeviceProc;functions.queueFamily=0;
+        {so::Overlay missing;require(missing.start(so::Enable::On,outside,identity,admitted,config(),sdk(),functions).status==so::Status::SdkFailure,"missing downstream physical handle refuses before query");
+            require(!interopPhysicalObserved,"missing handle never falls back to SDK public handle");}
+        functions.physicalForInstanceDispatch=h<VkPhysicalDevice>(0x2002);
+        {so::Overlay fsr4;require(fsr4.start(so::Enable::On,outside,identity,admitted,config(),sdk(),functions).status==so::Status::SdkFailure,"mock LUID refusal is reported");
+            require(interopPhysicalObserved==functions.physicalForInstanceDispatch&&interopPhysicalObserved!=identity.physicalDevice,"bridge receives raw layer handle, not loader wrapper");
+            require(std::string_view(fsr4.lastBackendError()).find("valid LUID")!=std::string_view::npos,"mock reached the physical-device query");}
+        require(sdkCalls==0,"FSR4 handle-domain test never creates XeSS SR context");
+        std::printf("{\"passed\":true,\"checks\":%u,\"publicAndLayerPhysicalDistinct\":true,\"gpuExecuted\":false}\n",checks);return 0;
+    }
     const auto admitted=admission();
     {
         so::Overlay o;require(o.state()==so::State::Disabled&&o.record({}).status==so::Status::Disabled&&!creates&&!executes,"default OFF performs no SDK/Vulkan work");

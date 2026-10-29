@@ -106,6 +106,10 @@
             xess_vk::sr_native_shaders::photoWriterSha256))result=xess_vk::sr_native_shaders::photoWriterProfile;
         if(result<0&&xess_vk::compute_observer::archivedShaderMatches(device->srShaders,reinterpret_cast<VkPipeline>(e.pipeline.handle),e.pipeline.generation,
             xess_vk::sr_native_shaders::characterMenuWriterSha256))result=xess_vk::sr_native_shaders::characterMenuWriterProfile;
+        if(result<0&&xess_vk::compute_observer::archivedShaderMatches(device->srShaders,reinterpret_cast<VkPipeline>(e.pipeline.handle),e.pipeline.generation,
+            xess_vk::sr_native_shaders::menuMaskWriterSha256))result=xess_vk::sr_native_shaders::menuMaskWriterProfile;
+        if(result<0&&xess_vk::compute_observer::archivedShaderMatches(device->srShaders,reinterpret_cast<VkPipeline>(e.pipeline.handle),e.pipeline.generation,
+            xess_vk::sr_native_shaders::menuDualMaskWriterSha256))result=xess_vk::sr_native_shaders::menuDualMaskWriterProfile;
         const bool characterMenu=result==xess_vk::sr_native_shaders::characterMenuWriterProfile||(result<0&&
             xess_vk::compute_observer::archivedShaderMatches(device->srShaders,reinterpret_cast<VkPipeline>(e.pipeline.handle),
                 e.pipeline.generation,xess_vk::sr_native_shaders::characterMenuReaderSha256));
@@ -173,14 +177,14 @@
     }
     // nullptr when the write provably covers the whole image; otherwise the first failed condition.
     static const char* replacementFullWriteRefusal(const xess_vk::descriptor_image_metadata::ImageBinding& b,
-                                                   const xess_vk::descriptor_image_metadata::DispatchEvidence& e,bool auxiliary,bool mask=false) noexcept {
+                                                   const xess_vk::descriptor_image_metadata::DispatchEvidence& e,bool auxiliary,bool mask=false,bool menuMask=false) noexcept {
         const auto& d=b.imageDescription;
         // The pinned writers use GlobalInvocationId.xy with
         // local size 8x8x1. Only a complete view and zero-based grid kill old content.
         if(!b.view.handle||!b.view.generation)return "view_unknown";
         if(b.arrayElement||b.viewType!=VK_IMAGE_VIEW_TYPE_2D)return "view_type";
         if(b.viewFormat!=d.format)return "view_format";
-        if(mask?d.format!=VK_FORMAT_R8_UNORM:
+        if((mask||menuMask)?d.format!=VK_FORMAT_R8_UNORM:
            !(d.format==VK_FORMAT_R16_SFLOAT||(auxiliary&&d.format==VK_FORMAT_R16G16B16A16_SFLOAT)))return "image_format";
         if(b.declaredLayout!=VK_IMAGE_LAYOUT_GENERAL)return "layout";
         if(b.components.r!=VK_COMPONENT_SWIZZLE_IDENTITY||b.components.g!=VK_COMPONENT_SWIZZLE_IDENTITY||
@@ -217,7 +221,8 @@
         line.number("base_mip",b.range.baseMipLevel);line.number("mip_count",b.range.levelCount);line.number("base_layer",b.range.baseArrayLayer);line.number("layer_count",b.range.layerCount);
         line.number("declared_layout",b.declaredLayout);
         line.number("groups_x",e.groups[0]);line.number("groups_y",e.groups[1]);line.number("groups_z",e.groups[2]);
-        const char* refusal=replacementFullWriteRefusal(b,e,pipeline.profile==xess_vk::sr_native_shaders::auxiliaryWriterProfile,pipeline.profile==1);
+        const char* refusal=replacementFullWriteRefusal(b,e,pipeline.profile==xess_vk::sr_native_shaders::auxiliaryWriterProfile,pipeline.profile==1,
+            xess_vk::sr_native_shaders::isMenuMaskWriter(pipeline.profile));
         line.text("full_write_refusal",refusal?refusal:"none");
         line.handle("command",f.command);line.number("recording",f.rpRecordingGeneration);line.number("order",f.commonRecordOrder);
         line.boolean("transaction_open",nativeTransaction.open());line.boolean("transaction_stopped",nativeTransaction.stopped());
@@ -295,16 +300,19 @@
                 const bool auxiliary=profile==xess_vk::sr_native_shaders::auxiliaryWriterProfile;
                 const bool mask=profile==1;
                 for(std::size_t n=0;n<e.guardImageCount;++n){const auto& b=e.bindings[n];
-                    // Exact pinned kept writers: set 0/b0 has OpImageWrite,
+                    // Exact pinned kept writers: their destination has OpImageWrite,
                     // no read. Keep the old-content watch until a full discard.
                     const bool keptWriter=profile==0||mask||profile==xess_vk::sr_native_shaders::auxiliaryWriterProfile||
-                        profile==xess_vk::sr_native_shaders::photoWriterProfile||profile==xess_vk::sr_native_shaders::characterMenuWriterProfile;
-                    const bool writeOnly=keptWriter&&direct&&e.metadataAccepted&&!e.issues&&b.setIndex==0&&(b.binding==0||(mask&&b.binding==1))&&
+                        profile==xess_vk::sr_native_shaders::photoWriterProfile||profile==xess_vk::sr_native_shaders::characterMenuWriterProfile||
+                        xess_vk::sr_native_shaders::isMenuMaskWriter(profile);
+                    const bool writeOnly=keptWriter&&direct&&e.metadataAccepted&&!e.issues&&b.setIndex==0&&
+                        (b.binding==0||((mask||profile==xess_vk::sr_native_shaders::menuDualMaskWriterProfile)&&b.binding==1))&&
                         b.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                     // A bound descriptor is not necessarily read by this shader.
                     // This does not discard its old content or prove a full write.
                     const bool notRead=direct&&e.guardImagesKnown&&!e.issues&&!pipeline.reads.mayRead(b.setIndex,b.binding);
-                    const bool photoClass=profile==xess_vk::sr_native_shaders::photoWriterProfile||profile==xess_vk::sr_native_shaders::characterMenuWriterProfile;
+                    const bool photoClass=profile==xess_vk::sr_native_shaders::photoWriterProfile||profile==xess_vk::sr_native_shaders::characterMenuWriterProfile||
+                        xess_vk::sr_native_shaders::isMenuMaskWriter(profile);
                     if(writeOnly&&(auxiliary||mask||photoClass)&&fullDestinationCount<fullDestinations.size())
                         fullDestinations[fullDestinationCount++]=&b;
                     if(diagnosticLoggingEnabled()&&nativeTransaction.watches(b.image))replacementWatchedUse(b,e,pipeline,writeOnly,notRead,direct,f);
@@ -341,7 +349,8 @@
                     const bool maskExtent=!mask||(t.nativePass==xess_vk::upscale_tail_probe::Pass::Transparency&&t.extentsKnown&&t.frame.valid&&
                         t.pipeline==e.pipeline.handle&&t.pipelineGeneration==e.pipeline.generation&&t.command==f.command&&t.recording==f.rpRecordingGeneration&&
                         t.groups==e.groups&&t.renderExtent.width==fullDestination->imageDescription.width&&t.renderExtent.height==fullDestination->imageDescription.height);
-                    const char* refusal=maskExtent?replacementFullWriteRefusal(*fullDestination,e,auxiliary,mask):"mask_extent";
+                    const char* refusal=maskExtent?replacementFullWriteRefusal(*fullDestination,e,auxiliary,mask,
+                        xess_vk::sr_native_shaders::isMenuMaskWriter(profile)):"mask_extent";
                     if(pending)*pending={f,fullDestination->image,e.pipeline,auxiliary||mask,!refusal,nativeTransaction.omitted(fullDestination->image),
                         fullDestination->imageDescription.width,fullDestination->imageDescription.height,e.groups,
                         refusal?refusal:"none",fullDestination->imageDescription.format,profile};
@@ -389,14 +398,17 @@
                entry.recording.commonRecordOrder!=f.commonRecordOrder)continue;
             const auto w=entry;entry={};
             // Content changes require the original writer's actual recording receipt, never just its intended coverage.
-            if(w.full&&forwarded){nativeTransaction.use(w.image,true);++(w.auxiliary?replacementAuxFullWrites:replacementPhotoFullWrites);}
-            else if(w.full){++(w.auxiliary?replacementAuxFullWritesSkipped:replacementPhotoFullWritesSkipped);
+            const bool menuMask=xess_vk::sr_native_shaders::isMenuMaskWriter(w.profile);
+            auto& applied=menuMask?replacementMenuMaskFullWrites:w.auxiliary?replacementAuxFullWrites:replacementPhotoFullWrites;
+            auto& skipped=menuMask?replacementMenuMaskSkipped:w.auxiliary?replacementAuxFullWritesSkipped:replacementPhotoFullWritesSkipped;
+            auto& refused=menuMask?replacementMenuMaskRefusals:w.auxiliary?replacementAuxCoverageRefusals:replacementPhotoCoverageRefusals;
+            if(w.full&&forwarded){nativeTransaction.use(w.image,true);++applied;}
+            else if(w.full){++skipped;
                 fullWriteRetiredWhileSuppressed+=w.omitted&&!nativeTransaction.omitted(w.image);}
-            else ++(w.auxiliary?replacementAuxCoverageRefusals:replacementPhotoCoverageRefusals);
-            const auto count=w.auxiliary?replacementAuxFullWrites+replacementAuxFullWritesSkipped+replacementAuxCoverageRefusals:
-                replacementPhotoFullWrites+replacementPhotoFullWritesSkipped+replacementPhotoCoverageRefusals;
+            else ++refused;
+            const auto count=applied+skipped+refused;
             // Diagnostic mode writes these to the main log: release builds have no observation stream.
-            if(count<=16&&diagnosticLoggingEnabled()){JsonLine line(w.auxiliary?"sr_auxiliary_overwrite":"sr_photo_overwrite");line.number("schema",4);
+            if(count<=16&&diagnosticLoggingEnabled()){JsonLine line(menuMask?"sr_menu_mask_overwrite":w.auxiliary?"sr_auxiliary_overwrite":"sr_photo_overwrite");line.number("schema",4);
                 line.boolean("full_coverage",w.full);line.text("coverage_refusal",w.refusal);line.number("format",w.format);line.number("writer_profile",w.profile);
                 line.boolean("will_apply",w.full&&forwarded);line.boolean("dispatch_forwarded",forwarded);
                 line.boolean("content_omitted_after",nativeTransaction.omitted(w.image));line.number("missing_core_contents",nativeTransaction.missingContents());

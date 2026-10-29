@@ -50,5 +50,7 @@ int main(int argc,char** argv){try{
         s=3;check(evidence.accept(s,R"({"event":"sr_watched_image_use","binding":4})")&&s==0);
         const std::string big="{\"event\":\"sr_prepare_outputs\",\"x\":\""+std::string(200000,'a')+"\"}";
         s=0;check(evidence.accept(s,big));s=0;check(!evidence.accept(s,big));}
+    {Policy backend;unsigned s=0;check(backend.accept(s,R"({"event":"sr_backend_runtime","backend":"fsr4_xmx_lite","submitted_frames":254,"pending_recordings":false})")&&s==0);
+        check(rule(R"({"event":"sr_shader_archive_chunk","hex":"abcd"})")==Rule::Off);}
     std::cout<<"{\"passed\":true,\"checks\":"<<checks<<"}\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

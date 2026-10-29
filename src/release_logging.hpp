@@ -68,7 +68,7 @@ inline Rule rule(View line) noexcept {
     const auto result=value(line,"result"),error=text(line,"error"),state=text(line,"state");
     const auto status=text(line,"status"),fault=value(line,"fault");
     // Targeted SR evidence: diagnostic mode only, quota-bounded by its producer and here.
-    if(e=="sr_watched_image_use"||e=="sr_prepare_outputs"||e=="sr_photo_overwrite"||e=="sr_auxiliary_overwrite"||
+    if(e=="sr_backend_runtime"||e=="sr_menu_mask_overwrite"||e=="sr_watched_image_use"||e=="sr_prepare_outputs"||e=="sr_photo_overwrite"||e=="sr_auxiliary_overwrite"||
        e=="sr_native_replacement_consumer"||e.starts_with("sr_native_fallback_"))return Rule::Evidence;
     if(e.find("error")!=e.npos||e.find("failed")!=e.npos||e.find("fatal")!=e.npos||e.ends_with("_too_large")||(!result.empty()&&result.front()=='-')||(!error.empty()&&error!="none")||state.starts_with("refused")||status.find("fail")!=status.npos||value(line,"stopped")=="true"||(!fault.empty()&&fault!="0"))return Rule::Fault;
     return Rule::Off;

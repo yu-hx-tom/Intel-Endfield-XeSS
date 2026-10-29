@@ -1,10 +1,17 @@
 #include "launcher_preferences.hpp"
 #include <cstdio>
 #include "game_frame_cap.hpp"
+#include "sr_backend.hpp"
 int main(){
     using namespace xess_vk::launcher_preferences;unsigned checks{};
     auto check=[&](bool good){++checks;if(!good)throw std::runtime_error("Launcher preference check failed");};
     try {
+        using xess_vk::sr_backend::Kind;
+        check(xess_vk::sr_backend::parse(L"")==Kind::XeSS);
+        check(xess_vk::sr_backend::parse(L"xess")==Kind::XeSS);
+        check(xess_vk::sr_backend::parse(L"fsr4_xmx_lite")==Kind::Fsr4XmxLite);
+        check(xess_vk::sr_backend::parse(L"fsr4")==Kind::Invalid);
+        check(xess_vk::sr_backend::parse(L"fsr4_xmx_lite ")==Kind::Invalid);
         for(const auto value:{"2","3\n"," 4\r\n"})check(parse(value,2,4,0)>=2);
         for(const auto value:{"","1","5","23","2garbage","2 3"})check(parse(value,2,4,0)==0);
         for(unsigned selected=2;selected<=4;++selected)

@@ -47,7 +47,7 @@ const std::string& event(const char* name){for(auto it=lines.rbegin();it!=lines.
 template<class Call>void preserved(Call call){SetLastError(54321);call();require(GetLastError()==54321,"archive preserves downstream LastError even when sink changes it");}
 struct Fixture {
     ShaderArchive* archive{};
-    explicit Fixture(bool fullGraph=false){lines.clear();throwChunk=reenter=false;reentryArchive=nullptr;preserved([&]{archive=createShaderArchive(h<VkDevice>(1),sink,fullGraph);});require(archive!=nullptr,"archive created");}
+    explicit Fixture(bool fullGraph=false,bool r8StorageOnly=false){lines.clear();throwChunk=reenter=false;reentryArchive=nullptr;preserved([&]{archive=createShaderArchive(h<VkDevice>(1),sink,fullGraph,r8StorageOnly);});require(archive!=nullptr,"archive created");}
     ~Fixture(){destroyShaderArchive(archive);}
     void add(VkShaderModule module,const std::vector<std::uint32_t>& code){VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};info.codeSize=code.size()*4;info.pCode=code.data();preserved([&]{archiveShader(archive,module,&info);});}
     void pipeline(VkPipeline pipe,std::uint64_t generation,VkShaderModule module,VkResult result=VK_SUCCESS,const VkSpecializationInfo* specialization=nullptr,VkPipelineLayout layout=VK_NULL_HANDLE){VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -354,5 +354,24 @@ void specializationAllocationFailures(){
     }
 }
 }
-int main(int argc,char** argv){try{require(argc==1||(argc==2&&std::strcmp(argv[1],"--dump-metadata")==0),"optional CPU metadata dump flag only");dumpMetadata=argc==2;shaderImageReads();runtimeAccessAfterArchiveLimits();shaderDigestAdmission();faultSelectionSink();specializationAllocationFailures();ownedPipelineMetadata();specializationRefusals();layoutRefusals();retryAfterLookupRefusal();multipleSelections();lifecycle();qualification();bounds();failures();std::cout<<"{\"passed\":true,\"checks\":"<<checks<<",\"module_limit\":32,\"byte_limit\":16777216,\"max_output_chunks\":128,\"dispatch_trace_started\":false,\"driver_calls\":0,\"game_touched\":false,\"shader_semantics_verified\":false,\"execute_permitted\":false}\n";return 0;}
+void diagnosticCaptureFilter(){
+    auto selected=makeCode(1);
+    for(std::size_t n=5;n<selected.size();n+=selected[n]>>16)if((selected[n]&65535)==25){selected[n+7]=2;selected[n+8]=15;break;}
+    Fixture f(true,true);
+    for(unsigned n=0;n<shaderArchiveFullGraphModuleLimit+3;++n){const auto module=h<VkShaderModule>(100+n);f.add(module,makeCode(2));destroyArchivedShader(f.archive,module);}
+    f.add(h<VkShaderModule>(2),makeCode(2));f.pipeline(h<VkPipeline>(3),10,h<VkShaderModule>(2));
+    require(archivedImageReads(f.archive,h<VkPipeline>(3),10).known,"probe filtering preserves ordinary live pipeline read facts");
+    const auto nonselected=archivedShaderFingerprint(f.archive,h<VkPipeline>(3),10);
+    require(archivedShaderMatches(f.archive,h<VkPipeline>(3),10,{nonselected.data(),nonselected.size()}),"probe filtering preserves ordinary runtime identity");
+    const auto before=lines.size();f.select(h<VkPipeline>(3),10);
+    require(lines.size()==before,"unrelated pipeline selection emits no refusal or source");
+    f.add(h<VkShaderModule>(4),selected);f.pipeline(h<VkPipeline>(5),11,h<VkShaderModule>(4));f.select(h<VkPipeline>(5),11);
+    require(restored()==bytes(selected),"small R8 storage module survives unrelated archive quotas");
+    const auto emitted=lines.size();f.add(h<VkShaderModule>(6),selected);f.pipeline(h<VkPipeline>(7),12,h<VkShaderModule>(6));f.select(h<VkPipeline>(7),12);
+    require(lines.size()==emitted,"different module and pipeline with identical code is captured once");
+    auto second=selected;second[2]=1;f.add(h<VkShaderModule>(8),second);f.pipeline(h<VkPipeline>(9),13,h<VkShaderModule>(8));f.select(h<VkPipeline>(9),13);
+    require(lines.size()>emitted,"another R8 storage variant is captured without a pinned hash");
+    require(archivedImageReads(f.archive,h<VkPipeline>(9),13).known,"capture eligibility grants no extra rendering access facts");
+}
+int main(int argc,char** argv){try{require(argc==1||(argc==2&&std::strcmp(argv[1],"--dump-metadata")==0),"optional CPU metadata dump flag only");dumpMetadata=argc==2;diagnosticCaptureFilter();shaderImageReads();runtimeAccessAfterArchiveLimits();shaderDigestAdmission();faultSelectionSink();specializationAllocationFailures();ownedPipelineMetadata();specializationRefusals();layoutRefusals();retryAfterLookupRefusal();multipleSelections();lifecycle();qualification();bounds();failures();std::cout<<"{\"passed\":true,\"checks\":"<<checks<<",\"module_limit\":32,\"byte_limit\":16777216,\"max_output_chunks\":128,\"dispatch_trace_started\":false,\"driver_calls\":0,\"game_touched\":false,\"shader_semantics_verified\":false,\"execute_permitted\":false}\n";return 0;}
     catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}}

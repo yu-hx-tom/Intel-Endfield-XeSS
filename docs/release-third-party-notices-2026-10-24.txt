@@ -5,10 +5,18 @@ The unmodified libxess.dll, libxess_fg.dll and libxell.dll are redistributed
 with the Intel Simplified Software License in mod/LICENSE.txt and the SDK
 third-party-programs notice in licenses/Intel-third-party-programs.txt.
 
-Endfield-Uncensored (EFU)
+Endfield-Uncensored (EFU), https://github.com/DynamiByte/Endfield-Uncensored
+AGPL-3.0, upstream commit eff32bbc89baaf25fcb25f2a8903990e172f319e.
 Locally modified, separately executed program. See mod/EFU-SOURCE-NOTICE.txt,
 mod/EFU-LICENSE.txt, and efu-corresponding-source/. That complete corresponding
 source includes local changes and the licenses for embedded fonts.
+
+FSR4 XMX Lite (optional experimental payload)
+The XMX variant and original-weights DLL are third-party binaries from a local
+OptiScaler distribution. Their public redistribution terms have not been
+verified. The FFX API headers are separate and their license does not establish
+redistribution rights for these binaries. The AMD FFX API header notice is in
+licenses/AMD-FFX-API-LICENSE.txt.
 
 MinHook / HDE
 See MINHOOK-LICENSE.txt. The observer and the separately built EFU use MinHook.

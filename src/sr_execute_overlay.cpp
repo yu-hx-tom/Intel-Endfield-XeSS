@@ -1,4 +1,6 @@
 #include "sr_execute_overlay.hpp"
+#include "fsr4_bridge.hpp"
+#include "sr_backend.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
@@ -69,6 +71,7 @@ SdkFunctions functions(const sr::Sdk& sdk) noexcept {
         sdk.xessVKCreateContext,sdk.xessForceLegacyScaleFactors,sdk.xessVKBuildPipelines,sdk.xessGetPipelineBuildStatus,
         sdk.xessGetOptimalInputResolution,sdk.xessVKInit,sdk.xessSetVelocityScale,sdk.xessVKExecute,sdk.xessDestroyContext};
 }
+Overlay::Overlay()=default;
 Overlay::~Overlay() {
     // Retain unsafe references rather than calling SDK destruction on the wrong
     // thread or while a recorded CB can still use the context.
@@ -78,7 +81,9 @@ bool Overlay::onInitialThread()const noexcept {return !initialThread_||initialTh
 Result Overlay::start(Enable enabled,HostPhase phase,const sr_game::RuntimeIdentity& identity,
                       const sr_game::RuntimeRequirementsAdmission& admission,const Configuration& config,SdkFunctions sdk,VulkanFunctions vk,std::size_t pendingLimit,bool blockingBuild) noexcept {
     if(!onInitialThread())return {Status::WrongThread};
-    if(context_||pending())return {Status::PendingCommands};
+    if(context_||(fsr4_&&state_!=State::Disabled)||pending())return {Status::PendingCommands};
+    if(fsr4_&&(identity.instance!=identity_.instance||identity.physicalDevice!=identity_.physicalDevice||
+        identity.device!=identity_.device||identity.incarnation!=identity_.incarnation))return {Status::InvalidConfiguration};
     if(enabled==Enable::Off){state_=State::Disabled;return {Status::Disabled};}
     if(phase!=HostPhase::OutsideApplicationRecording)return {Status::WrongHostPhase};
     if(!admission.admitted()||!admission.matches(identity)||!admission.matchesQueries(sdk.requirements))return {Status::RequirementsMissing};
@@ -87,6 +92,22 @@ Result Overlay::start(Enable enabled,HostPhase phase,const sr_game::RuntimeIdent
        !vk.enterInjectedRecording||!vk.leaveInjectedRecording)return {Status::InvalidConfiguration};
     pendingLimit_=pendingLimit;identity_=identity;sdk_=sdk;vk_=vk;config_=config;flags_=flags(config);resetRequired_=true;rejectedInputKnown_=false;lastFrame_=historyEpoch_=0;
     initialThread_=GetCurrentThreadId();
+    if(sr_backend::startup()==sr_backend::Kind::Invalid){state_=State::Failed;return {Status::InvalidConfiguration};}
+    if(sr_backend::startup()==sr_backend::Kind::Fsr4XmxLite){
+        sdkOperation_="ffxCreateContext";
+        try{
+            if(!vk.gipa||!vk.gdpa||!vk.physicalForInstanceDispatch||vk.queueFamily==VK_QUEUE_FAMILY_IGNORED)throw std::invalid_argument("FSR4 Vulkan context unavailable");
+            std::filesystem::path directory;
+            if(vk.fsr4Directory)directory=vk.fsr4Directory;
+            else{HMODULE module{};wchar_t path[32768]{};
+                if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&name),&module)||!GetModuleFileNameW(module,path,32768))throw std::runtime_error("FSR4 module path unavailable");
+                directory=std::filesystem::path(path).parent_path();}
+            if(!fsr4_)fsr4_=std::make_unique<fsr4::Bridge>(fsr4::VulkanContext{identity.instance,vk.physicalForInstanceDispatch,identity.device,vk.queueFamily,vk.gipa,vk.gdpa},directory);
+            fsr4_->configure(config);backendError_.clear();requested_=effective_=sr::closestPreset(config.input,config.output).quality;
+            state_=State::Ready;return {Status::Ready};
+        }catch(const std::exception& e){backendError(e.what());state_=State::Failed;return {Status::SdkFailure,XESS_RESULT_ERROR_UNKNOWN};}
+        catch(...){backendError("FSR4 initialization failed");state_=State::Failed;return {Status::SdkFailure,XESS_RESULT_ERROR_UNKNOWN};}
+    }
     sdkOperation_="xessVKCreateContext";
     auto r=sdk_.create(identity.instance,identity.physicalDevice,identity.device,&context_);
     if(r<0||!context_){state_=State::Failed;return {Status::SdkFailure,r};}
@@ -112,6 +133,14 @@ Result Overlay::initialize(HostPhase phase,const Configuration& c) noexcept {
     if(phase!=HostPhase::OutsideApplicationRecording)return {Status::WrongHostPhase};
     if(pending())return {Status::PendingCommands};
     if(state_==State::Building)return {Status::Building};
+    if(fsr4_){
+        if(state_==State::Failed)return {Status::SdkFailure};
+        if(!valid(c))return {Status::InvalidConfiguration};
+        if(state_==State::Ready&&same(config_,c))return {Status::Ready};
+        sdkOperation_="ffxCreateContext";
+        try{fsr4_->configure(c);backendError_.clear();config_=c;flags_=flags(c);resetRequired_=true;state_=State::Ready;return {Status::Ready};}
+        catch(...){state_=State::Failed;return {Status::SdkFailure,XESS_RESULT_ERROR_UNKNOWN};}
+    }
     if(!context_||state_==State::Failed)return {Status::SdkFailure};
     if(!valid(c)||flags(c)!=flags_)return {Status::InvalidConfiguration};
     if(state_==State::Ready&&same(config_,c))return {Status::Ready};
@@ -266,6 +295,13 @@ Result Overlay::record(const Frame& f) noexcept {
     xess_vk_execute_params_t p{};p.colorTexture=f.color.sdk;p.velocityTexture=f.motion.sdk;p.depthTexture=f.depth.sdk;p.outputTexture=f.nativeOutput.sdk;
     p.inputWidth=config_.input.width;p.inputHeight=config_.input.height;p.jitterOffsetX=f.jitterX;p.jitterOffsetY=f.jitterY;p.exposureScale=1.0f;p.resetHistory=reset;
     *pending={key(f.owner),{},0,SubmissionState::Recorded,true,false,f.recording.pool};++attempts_;
+    if(fsr4_){
+        sdkOperation_="ffxDispatch";
+        try{fsr4_->record(f,reset);backendError_.clear();resetRequired_=false;lastFrame_=f.owner.frame;historyEpoch_=f.historyEpoch;
+            return {Status::Recorded,XESS_RESULT_SUCCESS,attempts_,true,true,reset};}
+        catch(const std::exception& e){backendError(e.what());state_=State::Failed;resetRequired_=true;return {Status::SdkFailureCommandsUncertain,XESS_RESULT_ERROR_UNKNOWN,attempts_,false,false,reset};}
+        catch(...){backendError("FSR4 recording failed");state_=State::Failed;resetRequired_=true;return {Status::SdkFailureCommandsUncertain,XESS_RESULT_ERROR_UNKNOWN,attempts_,false,false,reset};}
+    }
     barriers(command,f,true);
     sdkOperation_="xessVKExecute";const auto r=sdk_.execute(context_,command,&p);
     if(r<0&&r!=XESS_RESULT_ERROR_UNINITIALIZED){
@@ -328,15 +364,22 @@ bool Overlay::submitted(const Submission& s) noexcept {
 bool Overlay::completed(const Completion& c) noexcept {
     for(auto& pending:pending_)if(pending.active&&pending.submission==SubmissionState::Submitted&&!pending.uncertain&&
         pending.key==c.recording&&pending.queue==c.queue&&pending.serial==c.serial&&c.actualFenceStatus==VK_SUCCESS) {
-        pending={};return true;
+        if(fsr4_)fsr4_->retire(pending.key);pending={};return true;
     }
     return false;
+}
+unsigned Overlay::pollBackendCompletions() noexcept {
+    if(!fsr4_)return 0;unsigned released{};
+    for(auto& p:pending_)if(p.active&&p.submission==SubmissionState::Submitted&&!p.uncertain&&fsr4_->completed(p.key)){
+        fsr4_->retire(p.key);p={};++released;
+    }
+    return released;
 }
 bool Overlay::discarded(RecordingKey k,Discard reason) noexcept {
     const bool known=reason==Discard::SuccessfulReset||reason==Discard::FreeObserved||reason==Discard::SuccessfulPoolReset||reason==Discard::PoolDestroyObserved;
     for(auto& pending:pending_)if(pending.active&&pending.key==k&&known&&
         (pending.submission==SubmissionState::Recorded||pending.submission==SubmissionState::FailedNotEnqueued)) {
-        pending={};resetRequired_=true;return true;
+        if(fsr4_)fsr4_->retire(pending.key);pending={};resetRequired_=true;return true;
     }
     return false;
 }
@@ -347,7 +390,7 @@ bool Overlay::retired(RecordingKey k,Discard reason) noexcept {
     // Mere fence polling or a private T3 slot completion cannot enter here.
     for(auto& pending:pending_)if(known&&pending.active&&pending.key==k&&
         pending.submission==SubmissionState::Submitted&&!pending.uncertain) {
-        pending={};return true;
+        if(fsr4_)fsr4_->retire(pending.key);pending={};return true;
     }
     return false;
 }
@@ -361,15 +404,16 @@ bool Overlay::deviceIdle(const sr_game::RuntimeIdentity& identity,VkResult r) no
     bool released=false;
     for(auto& pending:pending_)if(pending.active&&
         (pending.submission==SubmissionState::Submitted||pending.submission==SubmissionState::DeviceLost)) {
-        pending={};released=true;
+        if(fsr4_)fsr4_->retire(pending.key);pending={};released=true;
     }
-    return released;
+    if(fsr4_)fsr4_->deviceIdle();return released;
 }
 Result Overlay::stop(HostPhase phase) noexcept {
     if(!onInitialThread())return {Status::WrongThread};
     if(state_==State::Disabled)return {Status::Disabled};
     if(phase!=HostPhase::OutsideApplicationRecording)return {Status::WrongHostPhase};
     if(pending())return {Status::PendingCommands};
+    if(fsr4_)fsr4_->deactivate();
     if(context_){const auto r=sdk_.destroy(context_);if(r<0){state_=State::Failed;return {Status::SdkFailure,r};}context_=nullptr;}
     state_=State::Disabled;resetRequired_=true;return {Status::Disabled};
 }

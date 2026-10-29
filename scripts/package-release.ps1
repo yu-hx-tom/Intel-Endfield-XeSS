@@ -1,7 +1,7 @@
 ﻿#requires -Version 7.0
 #requires -PSEdition Core
 [CmdletBinding()]
-param([string]$BuildDirectory='build-release',[ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Version='0.1.0')
+param([string]$BuildDirectory='build-release',[ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Version='0.1.0',[string]$Fsr4XmxDirectory)
 $ErrorActionPreference='Stop'
 $project=Split-Path -Parent $PSScriptRoot
 $build=Join-Path $project $BuildDirectory
@@ -12,7 +12,7 @@ foreach($setting in @('CMAKE_BUILD_TYPE:STRING=Release','XESS_RELEASE_MINIMAL:BO
 $library=Join-Path $build 'observer/xess-vulkan-observer.dll'
 & (Join-Path $build 'xess-observer-interface-test.exe') --layer $library --release-minimal | Out-Host
 if($LASTEXITCODE){throw 'Release capability check failed.'}
-$stage=& (Join-Path $PSScriptRoot 'stage-mod-launcher.ps1') -WithXeFGSdk -BuildDirectory $BuildDirectory | ConvertFrom-Json
+$stage=& (Join-Path $PSScriptRoot 'stage-mod-launcher.ps1') -WithXeFGSdk -BuildDirectory $BuildDirectory -Fsr4XmxDirectory $Fsr4XmxDirectory | ConvertFrom-Json
 $stageRoot=$stage.packageDirectory
 $name="EndfieldXeSS-$Version-win64"
 $root=Join-Path $project "dist/$name"
@@ -56,6 +56,7 @@ $notices=@{
     'third_party/Vulkan-Headers/LICENSES/Apache-2.0.txt'='Apache-2.0.txt'
     'third_party/Vulkan-Headers/LICENSES/MIT.txt'='MIT.txt'
     'third_party/streamline_headers/license.txt'='Streamline-license.txt'
+    'third_party/ffx-api/LICENSE.txt'='AMD-FFX-API-LICENSE.txt'
     '.tools/llvm-mingw-20261006-ucrt-x86_64/LICENSE.TXT'='LLVM-MinGW-LICENSE.TXT'
 }
 foreach($entry in $notices.GetEnumerator()){Copy-Item -LiteralPath (Join-Path $project $entry.Key) -Destination (Join-Path $licenses $entry.Value)}
@@ -68,7 +69,7 @@ $files=@(Get-ChildItem -LiteralPath $root -File -Recurse|Sort-Object FullName|Fo
     [ordered]@{path=[IO.Path]::GetRelativePath($root,$_.FullName).Replace('\','/');bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
 })
 $manifest=[ordered]@{schema=1;version=$Version;flavor='release-minimal';platform='windows-x86_64';buildType='Release';researchDiagnostics=$false;cpuDiagnostics=$false;gpuDiagnostics=$false
-    defaultRoute='single-chain/synchronous-shared/T3.3';defaultLaunch='XeSS SR + menu-controlled XeSS FG';gameTested=$false;files=$files}
+    defaultRoute='single-chain/synchronous-shared/T3.3';defaultLaunch='XeSS SR + menu-controlled XeSS FG';fsr4XmxPackaged=[bool]$Fsr4XmxDirectory;gameTested=$false;files=$files}
 [IO.File]::WriteAllText((Join-Path $root 'release-manifest.json'),($manifest|ConvertTo-Json -Depth 6),$utf8)
 & (Join-Path $root 'Release.ps1') -Action Verify | Out-Host
 if($LASTEXITCODE){throw 'Release verification failed.'}

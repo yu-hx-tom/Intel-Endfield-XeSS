@@ -33,7 +33,7 @@ namespace {
 constexpr size_t receiptLimit=64*1024, scriptLimit=256*1024, statusLimit=256*1024, outputLimit=64*1024;
 constexpr UINT trayMessage=WM_APP+1, timerId=1;
 constexpr int startId=101, trayId=102, logsId=103, exitId=104, showId=105, multiplierId=106, applyId=107, noDitherId=108,
-    pathChangeId=109,pathDetectId=110,sceneId=111,debugId=112,advancedId=113,defaultsId=114,frameCapId=115,frameCapTargetId=116,diagnosticId=117;
+    pathChangeId=109,pathDetectId=110,sceneId=111,debugId=112,advancedId=113,defaultsId=114,frameCapId=115,frameCapTargetId=116,diagnosticId=117,srBackendId=118;
 constexpr UINT detectPathMessage=WM_APP+43;
 const wchar_t* productName=L"Endfield XeSS Launcher";
 constexpr char currentEfuSha256[]="65d34a67ae1e82b03e22ea7f38baffd5d75bcf5706a4f896e4633b55e2597e94";
@@ -231,7 +231,7 @@ bool fakeSwapchainRoute(LauncherMode mode){return mode==LauncherMode::XeFG||mode
 bool gpuTimestampsFromEnvironment(){wchar_t value[2]{};return GetEnvironmentVariableW(L"XESS_GPU_TIMESTAMPS",value,2)==1&&value[0]==L'1';}
 bool threadCpuSamplingFromEnvironment(){wchar_t value[2]{};return GetEnvironmentVariableW(L"XESS_THREAD_CPU_SAMPLING",value,2)==1&&value[0]==L'1';}
 bool trackingCpuTimingFromEnvironment(){wchar_t value[2]{};return GetEnvironmentVariableW(L"XESS_TRACKING_CPU_TIMING",value,2)==1&&value[0]==L'1';}
-std::vector<std::wstring> helperArgs(const std::wstring& powershell,const std::wstring& script,const std::wstring& session,bool captureRawColorOnce=false,bool presentationOff=false,bool xeFG=false,bool official=false,bool observeInputs=false,bool traceRenderTail=false,bool lowResOutput=false,bool traceAcquire=false,bool fakeSwapchain=false,bool gpuTimestamps=false,bool trackingCpuTiming=false,bool xessSr=false,bool disableNoDither=false,bool threadCpuSampling=false,unsigned fgDebugMode=0,int fgSceneIndex=-1,bool frameCapEnabled=false,unsigned frameCapTarget=40,bool diagnosticMode=false){
+std::vector<std::wstring> helperArgs(const std::wstring& powershell,const std::wstring& script,const std::wstring& session,bool captureRawColorOnce=false,bool presentationOff=false,bool xeFG=false,bool official=false,bool observeInputs=false,bool traceRenderTail=false,bool lowResOutput=false,bool traceAcquire=false,bool fakeSwapchain=false,bool gpuTimestamps=false,bool trackingCpuTiming=false,bool xessSr=false,bool disableNoDither=false,bool threadCpuSampling=false,unsigned fgDebugMode=0,int fgSceneIndex=-1,bool frameCapEnabled=false,unsigned frameCapTarget=40,bool diagnosticMode=false,bool fsr4Sr=false){
     if(!hexString(utf8(session),32))throw std::runtime_error("Invalid session ID");
     if(disableNoDither&&official)throw std::runtime_error("Official launch does not load the no-dither mod");
     if(xessSr&&(!xeFG||!fakeSwapchain))throw std::runtime_error("XeSS SR requires the single-chain XeFG route");
@@ -257,6 +257,7 @@ std::vector<std::wstring> helperArgs(const std::wstring& powershell,const std::w
         if(diagnosticMode)result.push_back(L"-DiagnosticMode");
     }
     if(xessSr)result.push_back(L"-XessSr");
+    if(fsr4Sr){if(!xessSr)throw std::runtime_error("FSR4 requires the SR replacement route");result.push_back(L"-SrBackend");result.push_back(L"Fsr4XmxLite");}
     if(disableNoDither)result.push_back(L"-DisableNoDither");
     if(traceRenderTail)result.push_back(L"-TraceRenderTail");
     if(traceAcquire)result.push_back(L"-WsiAcquireTrace");
@@ -293,6 +294,7 @@ std::vector<wchar_t> helperEnvironment(const std::vector<std::wstring>& inherite
     entries[L"PSModulePath"]=(std::filesystem::path(powershell).parent_path()/L"Modules").wstring();
     entries.erase(L"EFU_NO_DITHER");
     entries.erase(L"XESS_SR_REPLACE");
+    entries.erase(L"XESS_SR_BACKEND");
     entries.erase(L"XESS_CONTINUOUS_INPUTS");
     entries.erase(L"XESS_FSR_NATIVE_OFF");
     entries.erase(L"XESS_XEFG_LOW_RES_OUTPUT");
@@ -352,7 +354,7 @@ struct TrustedHelper {
     Handle runtimeLock,directoryLock,receiptLock,scriptLock,process,pipe;
     void releaseLocks(){scriptLock.reset();receiptLock.reset();directoryLock.reset();runtimeLock.reset();}
 };
-TrustedHelper launchTrustedHelper(const std::wstring& installRoot,const std::wstring& powershell,bool readonly,const std::wstring& session={},bool captureRawColorOnce=false,bool presentationOff=false,bool xeFG=false,bool official=false,bool observeInputs=false,bool traceRenderTail=false,bool lowResOutput=false,bool traceAcquire=false,bool fakeSwapchain=false,bool gpuTimestamps=false,bool trackingCpuTiming=false,bool xessSr=false,bool disableNoDither=false,bool threadCpuSampling=false,unsigned fgDebugMode=0,const std::wstring& settingPath={},int fgSceneIndex=-1,bool frameCapEnabled=false,unsigned frameCapTarget=40,bool diagnosticMode=false){
+TrustedHelper launchTrustedHelper(const std::wstring& installRoot,const std::wstring& powershell,bool readonly,const std::wstring& session={},bool captureRawColorOnce=false,bool presentationOff=false,bool xeFG=false,bool official=false,bool observeInputs=false,bool traceRenderTail=false,bool lowResOutput=false,bool traceAcquire=false,bool fakeSwapchain=false,bool gpuTimestamps=false,bool trackingCpuTiming=false,bool xessSr=false,bool disableNoDither=false,bool threadCpuSampling=false,unsigned fgDebugMode=0,const std::wstring& settingPath={},int fgSceneIndex=-1,bool frameCapEnabled=false,unsigned frameCapTarget=40,bool diagnosticMode=false,bool fsr4Sr=false){
     if(readonly&&(captureRawColorOnce||presentationOff||xeFG||official||observeInputs||traceRenderTail||lowResOutput||traceAcquire||fakeSwapchain||gpuTimestamps||trackingCpuTiming||threadCpuSampling||fgDebugMode||fgSceneIndex>=0||frameCapEnabled||!settingPath.empty()))throw std::runtime_error("Readonly helper cannot request a launch mode");
     TrustedHelper result;
     result.runtimeLock=lockPowerShell7(powershell);
@@ -372,7 +374,7 @@ TrustedHelper launchTrustedHelper(const std::wstring& installRoot,const std::wst
     if(!InitializeProcThreadAttributeList(startup.lpAttributeList,1,0,&attributeBytes))throw failure("Create inherited-handle list");
     HANDLE inherited[]{input.h,pipeWriter.h};BOOL updated=UpdateProcThreadAttribute(startup.lpAttributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherited,sizeof(inherited),nullptr,nullptr);
     auto arguments=readonly?statusArgs(powershell,script):settingPath.empty()?
-        helperArgs(powershell,script,session,captureRawColorOnce,presentationOff,xeFG,official,observeInputs,traceRenderTail,lowResOutput,traceAcquire,fakeSwapchain,gpuTimestamps,trackingCpuTiming,xessSr,disableNoDither,threadCpuSampling,fgDebugMode,fgSceneIndex,frameCapEnabled,frameCapTarget,diagnosticMode):
+        helperArgs(powershell,script,session,captureRawColorOnce,presentationOff,xeFG,official,observeInputs,traceRenderTail,lowResOutput,traceAcquire,fakeSwapchain,gpuTimestamps,trackingCpuTiming,xessSr,disableNoDither,threadCpuSampling,fgDebugMode,fgSceneIndex,frameCapEnabled,frameCapTarget,diagnosticMode,fsr4Sr):
         std::vector<std::wstring>{powershell,L"-NoProfile",L"-NonInteractive",L"-ExecutionPolicy",L"Bypass",L"-File",script,L"-Action",L"SetGamePath",L"-GameDirectory",settingPath};
     auto command=commandLine(arguments);PROCESS_INFORMATION child{};
     const BOOL created=updated&&CreateProcessW(powershell.c_str(),command.data(),nullptr,nullptr,TRUE,
@@ -411,7 +413,7 @@ unsigned monitorRefresh(HWND window) noexcept {
 struct App {
     xess_vk::launcher_ui::Theme theme;
     UINT activationMessage{};
-    HWND window{},status{},start{},multiplier{},noDitherControl{},pathControl{},pathStatus{},sceneControl{},debugControl{},debugWarning{},frameCapControl{},frameCapTargetControl{},diagnosticControl{};
+    HWND window{},status{},start{},multiplier{},noDitherControl{},pathControl{},pathStatus{},sceneControl{},debugControl{},debugWarning{},frameCapControl{},frameCapTargetControl{},diagnosticControl{},srBackendControl{};
     unsigned frameCapTarget=40;
     bool pathValid{},advanced{};unsigned pathJob{};std::wstring configuredGameDirectory,preferenceWarning;HFONT font{};bool tray=false,busy=false,captureRawColorOnce=false,presentationOff=false,xeFG=false,official=false,observeInputs=false,traceRenderTail=false,lowResOutput=false,traceAcquire=false,fakeSwapchain=false,gpuTimestamps=false,trackingCpuTiming=false,xessSr=false,threadCpuSampling=false;UINT taskbarCreated{};
     std::wstring installRoot,sessionRoot,session,sessionDirectory,powershell;std::string helperOutput;
@@ -500,6 +502,7 @@ struct App {
     }
     void toggleAdvanced(){advanced=!advanced;ShowWindow(debugControl,advanced?SW_SHOW:SW_HIDE);ShowWindow(debugWarning,advanced?SW_SHOW:SW_HIDE);}
     void restoreDefaults(){
+        SendMessageW(srBackendControl,CB_SETCURSEL,0,0);
         SendMessageW(diagnosticControl,BM_SETCHECK,BST_UNCHECKED,0);
         SendMessageW(multiplier,CB_SETCURSEL,0,0);SendMessageW(sceneControl,CB_SETCURSEL,0,0);SendMessageW(debugControl,CB_SETCURSEL,0,0);
         SendMessageW(noDitherControl,BM_SETCHECK,BST_CHECKED,0);SendMessageW(frameCapControl,BM_SETCHECK,BST_UNCHECKED,0);frameCapTarget=40;SetWindowTextW(frameCapTargetControl,L"40");EnableWindow(frameCapTargetControl,FALSE);saveMultiplier();
@@ -524,6 +527,9 @@ struct App {
             xess_vk::launcher_preferences::save(xess_vk::launcher_preferences::frameCapTargetPath,frameCapTarget);
             if(!capValue)SetWindowTextW(frameCapTargetControl,std::to_wstring(frameCapTarget).c_str());
             xess_vk::launcher_preferences::save(xess_vk::launcher_preferences::multiplierPath,unsigned(selection)+2);
+            const auto srBackend=SendMessageW(srBackendControl,CB_GETCURSEL,0,0);
+            if(srBackend<0||srBackend>1)throw std::runtime_error("Invalid SR backend selection");
+            xess_vk::launcher_preferences::save(xess_vk::launcher_preferences::srBackendPath,unsigned(srBackend));
             const auto scene=SendMessageW(sceneControl,CB_GETCURSEL,0,0),debug=SendMessageW(debugControl,CB_GETCURSEL,0,0);
             if(scene<0||scene>6||debug<0||debug>3)throw std::runtime_error("Invalid FG setting selection");
             xess_vk::launcher_preferences::save(xess_vk::launcher_preferences::sceneThresholdPath,unsigned(scene));
@@ -551,7 +557,7 @@ struct App {
             diagnosticActive=releaseMinimal&&SendMessageW(diagnosticControl,BM_GETCHECK,0,0)==BST_CHECKED;
             SendMessageW(diagnosticControl,BM_SETCHECK,BST_UNCHECKED,0);
             session=newSession();sessionDirectory=(!releaseMinimal||diagnosticActive)?sessionRoot+L"\\"+session:L"";helperOutput.clear();
-            helper=launchTrustedHelper(installRoot,powershell,false,session,captureRawColorOnce,presentationOff,xeFG,official,observeInputs,traceRenderTail,lowResOutput,traceAcquire,fakeSwapchain,gpuTimestamps,trackingCpuTiming,xessSr,!noDither&&!official,threadCpuSampling,unsigned(SendMessageW(debugControl,CB_GETCURSEL,0,0)),{},xeFG?int(SendMessageW(sceneControl,CB_GETCURSEL,0,0)):-1,xeFG&&!official&&SendMessageW(frameCapControl,BM_GETCHECK,0,0)==BST_CHECKED,frameCapTarget,diagnosticActive);SendMessageW(debugControl,CB_SETCURSEL,0,0);busy=true;SetTimer(window,timerId,500,nullptr);EnableWindow(start,FALSE);
+            helper=launchTrustedHelper(installRoot,powershell,false,session,captureRawColorOnce,presentationOff,xeFG,official,observeInputs,traceRenderTail,lowResOutput,traceAcquire,fakeSwapchain,gpuTimestamps,trackingCpuTiming,xessSr,!noDither&&!official,threadCpuSampling,unsigned(SendMessageW(debugControl,CB_GETCURSEL,0,0)),{},xeFG?int(SendMessageW(sceneControl,CB_GETCURSEL,0,0)):-1,xeFG&&!official&&SendMessageW(frameCapControl,BM_GETCHECK,0,0)==BST_CHECKED,frameCapTarget,diagnosticActive,xessSr&&!official&&SendMessageW(srBackendControl,CB_GETCURSEL,0,0)==1);SendMessageW(debugControl,CB_SETCURSEL,0,0);busy=true;SetTimer(window,timerId,500,nullptr);EnableWindow(start,FALSE);
             setStatus(L"正在等待启动助手 / 正常系统授权…\r\n这一步仅提交启动请求，不表示画面功能已生效。");
         }catch(const std::exception& error){helper.releaseLocks();helper.pipe.reset();helper.process.reset();busy=false;KillTimer(window,timerId);EnableWindow(start,pathValid);setStatus(L"无法启动：\r\n"+wide(error.what()));}
     }
@@ -596,7 +602,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp){
     case WM_SIZE:if(wp==SIZE_MINIMIZED){app->hide();return 0;}break;
     case detectPathMessage:app->detectPath();return 0;
     case WM_COMMAND:switch(LOWORD(wp)){
-        case diagnosticId:app->setStatus(L"诊断选择仅下一次启动生效，启动后自动取消勾选。");break;case frameCapId:app->frameCapChanged();break;case applyId:app->saveMultiplier();break;case noDitherId:app->noDitherChanged();break;
+        case srBackendId:app->setStatus(L"超分方案仅下次启动生效；帧生成仍由 XeSS 提供。");break;case diagnosticId:app->setStatus(L"诊断选择仅下一次启动生效，启动后自动取消勾选。");break;case frameCapId:app->frameCapChanged();break;case applyId:app->saveMultiplier();break;case noDitherId:app->noDitherChanged();break;
         case pathChangeId:app->choosePath();break;case pathDetectId:app->detectPath();break;
         case defaultsId:app->restoreDefaults();break;case advancedId:app->toggleAdvanced();break;
         case startId:app->startGame();break;case trayId:app->hide();break;case logsId:app->openLogs();break;case showId:app->show();break;
@@ -770,6 +776,11 @@ int selfTest(){
         check(std::count(srArgs.begin(),srArgs.end(),L"-XessSr")==1&&std::count(srArgs.begin(),srArgs.end(),L"-GpuTimestamps")==unsigned(gpu),"SR activation and explicit GPU timestamp request are independent");
     }
     check(refuses([&]{helperArgs(L"ps",L"script",session,false,false,false,false,false,false,false,false,false,false,false,true);}),"SR cannot enter a legacy or non-XeFG route");
+    {const auto fsr4Args=helperArgs(L"ps",L"script",session,false,false,true,false,false,false,true,false,true,false,false,true,false,false,0,-1,false,40,false,true);
+        const auto backend=std::find(fsr4Args.begin(),fsr4Args.end(),L"-SrBackend");
+        check(backend!=fsr4Args.end()&&std::next(backend)!=fsr4Args.end()&&*std::next(backend)==L"Fsr4XmxLite","FSR4 startup selection is a typed helper argument");
+        check(std::count(fsr4Args.begin(),fsr4Args.end(),L"-XessSr")==1,"FSR4 uses the existing SR replacement route");
+        check(refuses([&]{helperArgs(L"ps",L"script",session,false,false,true,false,false,false,true,false,true,false,false,false,false,false,0,-1,false,40,false,true);}),"FSR4 cannot bypass SR replacement");}
     const auto cleanSrEnvironment=helperEnvironment({L"XESS_SR_REPLACE=1"},L"C:\\Program Files\\PowerShell\\7\\pwsh.exe");
     check(std::wstring(cleanSrEnvironment.data(),cleanSrEnvironment.size()).find(L"XESS_SR_REPLACE")==std::wstring::npos,"normal helper does not inherit SR activation");
     const auto captureArgs=helperArgs(L"ps",L"script",session,true);
@@ -821,7 +832,7 @@ int selfTest(){
     const auto readonlyArgs=commandLine(statusArgs(ps,L"C:\\Program Files\\EndfieldXeSSObserver\\manage-observer-install.ps1"));
     check(readonlyArgs.find(L"Status")!=std::wstring::npos&&readonlyArgs.find(L"LaunchMod")==std::wstring::npos&&readonlyArgs.find(L"CaptureRawColor")==std::wstring::npos,"Readonly probe cannot launch game or capture");
     const auto environment=helperEnvironment({L"psmodulepath=C:\\PowerShell7\\Modules",L"PSMODULEPATH=C:\\wrong",L"PATH=C:\\Windows",L"=C:=C:\\example",L"KEEP=unchanged",
-        L"xess_continuous_inputs=1",L"XESS_FSR_NATIVE_OFF=1",L"xess_xefg_low_res_output=1",L"xess_wsi_acquire_observer=1",L"xess_fake_swapchain=1",L"xess_gpu_timestamps=1",L"xess_tracking_cpu_timing=1",L"DISABLE_RTSS_LAYER=0"},ps);
+        L"xess_continuous_inputs=1",L"XESS_FSR_NATIVE_OFF=1",L"xess_sr_backend=fsr4_xmx_lite",L"xess_xefg_low_res_output=1",L"xess_wsi_acquire_observer=1",L"xess_fake_swapchain=1",L"xess_gpu_timestamps=1",L"xess_tracking_cpu_timing=1",L"DISABLE_RTSS_LAYER=0"},ps);
     std::map<std::wstring,std::wstring,EnvironmentNameLess> parsedEnvironment;
     for(const wchar_t* entry=environment.data();*entry;entry+=wcslen(entry)+1){const std::wstring value=entry;const auto at=value.find(L'=',1);parsedEnvironment[value.substr(0,at)]=value.substr(at+1);}
     check(parsedEnvironment.size()==5,"Module path duplicates replaced case-insensitively");
@@ -830,6 +841,7 @@ int selfTest(){
     check(parsedEnvironment.at(L"PATH")==L"C:\\Windows"&&parsedEnvironment.at(L"KEEP")==L"unchanged","Unrelated child environment preserved");
     check(parsedEnvironment.at(L"=C:")==L"C:\\example","Hidden drive environment preserved");
     check(!parsedEnvironment.contains(L"XESS_CONTINUOUS_INPUTS")&&!parsedEnvironment.contains(L"XESS_FSR_NATIVE_OFF"),"Helper cannot inherit another mode's continuous/native-off switches");
+    check(!parsedEnvironment.contains(L"XESS_SR_BACKEND"),"Helper cannot inherit another launcher's SR backend");
     check(!parsedEnvironment.contains(L"XESS_XEFG_LOW_RES_OUTPUT"),"Helper cannot inherit low-resolution output opt-in");
     check(!parsedEnvironment.contains(L"XESS_WSI_ACQUIRE_OBSERVER"),"Helper cannot inherit acquire observation opt-in");
     check(!parsedEnvironment.contains(L"XESS_FAKE_SWAPCHAIN"),"Helper cannot inherit fake swapchain opt-in");
@@ -975,7 +987,12 @@ int runGui(HINSTANCE instance,bool captureRawColorOnce=false,bool presentationOf
     state.noDitherControl=control(L"BUTTON",L"启动时开启免虚化",30,278,220,26,noDitherId,BS_AUTOCHECKBOX|WS_TABSTOP);
     const auto noDither=preferences::read(preferences::noDitherPath,0,1,99);
     state.noDither=noDither!=0;SendMessageW(state.noDitherControl,BM_SETCHECK,state.noDither?BST_CHECKED:BST_UNCHECKED,0);
-    control(L"STATIC",L"游戏内选择 AMD FSR3；\r\n开启帧生成后由 XeSS 接管。",30,311,216,34,0,0,Font::Small);
+    control(L"STATIC",L"超分方案",30,315,76,22,0,0,Font::Small);
+    state.srBackendControl=control(L"COMBOBOX",L"",112,309,130,120,srBackendId,CBS_DROPDOWNLIST|WS_TABSTOP);
+    for(const auto label:{L"XeSS",L"FSR4 XMX Lite"})SendMessageW(state.srBackendControl,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(label));
+    SendMessageW(state.srBackendControl,CB_SETCURSEL,preferences::read(preferences::srBackendPath,0,1,0),0);
+    SendMessageW(state.srBackendControl,CB_SETDROPPEDWIDTH,190,0);
+    EnableWindow(state.srBackendControl,xessSr&&!official);
     if(multiplier==99&&GetFileAttributesW(preferences::multiplierPath)!=INVALID_FILE_ATTRIBUTES)state.preferenceWarning=L"倍率配置无效，已使用2×默认值。";
     if(scene==99&&GetFileAttributesW(preferences::sceneThresholdPath)!=INVALID_FILE_ATTRIBUTES)state.preferenceWarning+=L" 阈值配置无效，已使用SDK默认。";
     if(noDither==99&&GetFileAttributesW(preferences::noDitherPath)!=INVALID_FILE_ATTRIBUTES)state.preferenceWarning+=L" 免虚化配置无效，已使用开启默认值。";

@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([switch]$WithXeFGSdk, [string]$PayloadPackageDirectory, [string]$BuildDirectory='build')
+param([switch]$WithXeFGSdk, [string]$PayloadPackageDirectory, [string]$BuildDirectory='build', [string]$Fsr4XmxDirectory)
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSEdition -cne 'Core' -or $PSVersionTable.PSVersion.Major -ne 7) { throw 'Staging requires PowerShell 7 Core.' }
 $stageJsonOptions = @{}
@@ -54,6 +54,18 @@ foreach ($relative in $copies.Keys) {
     }
     $files += [ordered]@{ name=$copies[$relative]; sha256=$after; sourceSha256=$before; manifestRelocated=$relocated; bytes=(Get-Item -LiteralPath $destination).Length }
 }
+if ($Fsr4XmxDirectory) {
+    if (-not $WithXeFGSdk -or -not [IO.Path]::IsPathFullyQualified($Fsr4XmxDirectory)) { throw 'FSR4 staging requires the SDK payload and an absolute source directory.' }
+    $fsr4Files = [ordered]@{ 'amd_fidelityfx_upscaler_dx12.dll'='74d18f09285150fa5531d1e5ffbad6a21b677e4eb1bc34cb580b2963f560e740'; 'fsr-original.dll'='c33a287f3048bf02311cae430b6a977500b94ca7b315cd7bff751e6b03e483e3' }
+    foreach ($name in $fsr4Files.Keys) {
+        $source = Join-Path $Fsr4XmxDirectory $name
+        if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fsr4Files[$name]) { throw "Unreviewed FSR4 XMX file: $name" }
+        $destination = Join-Path $mod $name;Copy-Item -LiteralPath $source -Destination $destination
+        $after = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($after -cne $fsr4Files[$name]) { throw "FSR4 package copy mismatch: $name" }
+        $files += [ordered]@{name="mod\$name";sha256=$after;sourceSha256=$after;manifestRelocated=$false;bytes=(Get-Item -LiteralPath $destination).Length}
+    }
+}
 # Verify the reviewed source before copying. Only checkout-location metadata
 # is normalized afterwards; code, patches and licenses remain byte-identical.
 $efuSourceRoot = Join-Path $project 'out\efu-launcher-options-20261023\source'
@@ -91,6 +103,7 @@ $efuProvenance|Add-Member -NotePropertyName distributionMetadataNormalization -N
 $manager = Join-Path $package 'manage-observer-install.ps1'
 $plan = (& $manager -Action ReviewPlan -SourceDirectory $observer -WithModLauncher -ModPayloadDirectory $mod -WithXeFGSdk:$WithXeFGSdk) | ConvertFrom-Json @stageJsonOptions
 $expectedFiles = if ($WithXeFGSdk) { 12 } else { 8 }
+if ($Fsr4XmxDirectory) { $expectedFiles += 2 }
 if ($plan.changesPerformed -or $plan.copiedFiles.Count -ne $expectedFiles) { throw 'Unexpected launcher review-plan file count.' }
 [IO.File]::WriteAllText((Join-Path $package 'review-plan.json'), ($plan | ConvertTo-Json -Depth 10), $utf8)
 $statePath = Join-Path $project 'out\standalone-launcher-pending-deployment.json'
@@ -173,6 +186,22 @@ mod/EFU-SOURCE-NOTICE.txt。免虚化指近距离角色淡出/抖动透明，
 完整对应源码和嵌入字体的许可证保留在 efu-corresponding-source 目录。
 '@
 $readme = $readme.Replace('@EFU_VERIFICATION@', $efuVerificationSentence)
+if ($Fsr4XmxDirectory) {
+    $apiNotice=Get-Content -LiteralPath (Join-Path $project 'third_party/ffx-api/api/include/ffx_api.h') -TotalCount 21
+    [IO.File]::WriteAllText((Join-Path $package 'FFX-API-NOTICE.txt'),(($apiNotice -replace '^// ?', '') -join [Environment]::NewLine),$utf8)
+    $readme = @'
+FSR4 XMX Lite 首版（本地实验候选，尚未实机验收）
+启动器“超分方案”只提供 XeSS / FSR4 XMX Lite 两项，下次启动游戏生效。
+FSR4 固定使用查询得到的 4.1.2X Lite，不提供其他模型；帧生成继续使用 XeSS。
+游戏内仍选择 AMD FSR3 及放大档位，以提供原有输入和菜单控制。
+首次短测建议 1080p、平衡档、帧生成关闭；先确认超分，再开启补帧。
+默认不启用诊断日志或监控面板。此候选不会自动安装或更新 GitHub 发行版。
+已通过 B390 上真实 D3D12 执行和 1080p/1440p Vulkan 往返测试；
+游戏中的画质、帧生成组合、切菜单/分辨率/退出及功耗仍需验收。
+XMX DLL 来源为用户提供的本地包，公开分发前另行核对其授权与来源。
+
+'@ + $readme
+}
 $developmentMode = if ($WithXeFGSdk) {
     '默认 EXE 保持 EFU 免虚化直启；显式 --xefg 使用随包的 Intel 原版 SDK，默认单链、LocalFiOff 和低分辨率输出。' + "`r`n" +
     '--xefg --full-res-output 保留全分辨率基线；菜单 ON 才触发 XeSS，实际输出尺寸与回退见帧日志。RTSS 帧率显示保留。'
@@ -195,6 +224,7 @@ $record = [ordered]@{ createdAt=(Get-Date).ToString('o'); packageDirectory=$pack
     gameXeFGIntegrated=$false; gameGeneratedFramesVerified=$false
     rawColorCaptureEnabledByDefault=$false; developmentCaptureFrontendSwitch='--capture-rawcolor-once'
     xeFGSdkPackaged=[bool]$WithXeFGSdk; xeFGSdkVersion=if ($WithXeFGSdk) { '3.0.2' } else { $null }
+    fsr4XmxLite=[ordered]@{packaged=[bool]$Fsr4XmxDirectory;model='4.1.2X Lite';gameVerified=$false;publicRedistributionReviewed=$false;selection='startup_only'}
     presentationOffEnabledByDefault=$false; presentationOffFrontendSwitch='--presentation-off'
     presentationOffGameVerified=$false
     xeFGFrontendSwitch='--xefg'; xeFGExperimental=$true; xeFGEnabledByLaunchRoute=$false

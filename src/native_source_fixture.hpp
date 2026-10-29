@@ -51,6 +51,7 @@ struct SourceOwner {
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    VkPhysicalDeviceSynchronization2Features synchronization2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     const char* enabledExtensions[2]{VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME};
@@ -112,7 +113,7 @@ struct SourceOwner {
             // handles may remain alive. Process exit is the final owner here.
         }
     }
-    void initialize(xess_vk::InteropConfig config, bool useDepthStencilSource = false) {
+    void initialize(xess_vk::InteropConfig config, bool useDepthStencilSource = false, bool enableSynchronization2 = false) {
         config.validate();
         cfg = config;
         depthStencilSource = useDepthStencilSource;
@@ -120,7 +121,7 @@ struct SourceOwner {
         if (!loader) throw std::runtime_error("No system Vulkan loader");
         gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
         if (!gipa) throw std::runtime_error("No vkGetInstanceProcAddr");
-        application.pApplicationName = "Native Vulkan source-image bridge self-test"; application.apiVersion = VK_API_VERSION_1_2;
+        application.pApplicationName = "Native Vulkan source-image bridge self-test"; application.apiVersion = enableSynchronization2?VK_API_VERSION_1_3:VK_API_VERSION_1_2;
         instanceInfo.pApplicationInfo = &application;
         check(inst<PFN_vkCreateInstance>("vkCreateInstance")(&instanceInfo, nullptr, &instance), "vkCreateInstance");
         uint32_t count = 0;
@@ -142,6 +143,7 @@ struct SourceOwner {
         family = static_cast<uint32_t>(selected - families.begin());
         queueInfo.queueFamilyIndex = family; queueInfo.queueCount = 1; queueInfo.pQueuePriorities = &priority;
         timeline.timelineSemaphore = VK_TRUE;
+        if(enableSynchronization2){synchronization2.synchronization2=VK_TRUE;timeline.pNext=&synchronization2;}
         deviceInfo.pNext = &timeline; deviceInfo.queueCreateInfoCount = 1; deviceInfo.pQueueCreateInfos = &queueInfo;
         deviceInfo.enabledExtensionCount = 2; deviceInfo.ppEnabledExtensionNames = enabledExtensions;
         check(inst<PFN_vkCreateDevice>("vkCreateDevice")(physical, &deviceInfo, nullptr, &device), "vkCreateDevice(source owner)");

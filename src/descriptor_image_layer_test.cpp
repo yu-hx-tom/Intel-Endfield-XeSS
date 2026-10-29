@@ -182,7 +182,9 @@ void shaderArchiveForwarding() {
     for(const auto& profile:xess_vk::sr_native_shaders::profiles)require(xess_vk::sr_native_shaders::needsTypedEvidence(profile.sha256),"every fixed FSR/motion module retains typed evidence");
     require(xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::auxiliaryWriterSha256)&&
         xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::photoWriterSha256)&&
-        xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::characterMenuWriterSha256),"auxiliary and photo write exceptions require full typed destinations");
+        xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::characterMenuWriterSha256)&&
+        xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::menuMaskWriterSha256)&&
+        xess_vk::sr_native_shaders::needsTypedEvidence(xess_vk::sr_native_shaders::menuDualMaskWriterSha256),"pinned full writers require typed destinations, including both R8 menu writers");
     SetLastError(0x12345678);classifyCompactPipeline(&f.state,evidence.pipeline);
     const auto membership=di::preDispatch(f.state.descriptors,cb,1,1,1,di::DispatchKind::Direct,nullptr,{},{},nullptr,full);
     require(GetLastError()==0x12345678&&membership.membershipOnly&&membership.guardImagesKnown&&!membership.metadataAccepted,

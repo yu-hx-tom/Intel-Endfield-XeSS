@@ -324,10 +324,11 @@ struct ShaderArchive {
         selections{},selectionRefused{},outputChunks{},outputBytes{},summaries{};
     std::uint64_t setLayoutCalls{},pipelineLayoutCalls{},layoutInputRefused{},layoutBudgetRefused{},layoutCapacityRefused{},layoutBytes{},
         specializationCalls{},specializationRefused{},specializationBytes{},specializationOutputChunks{};
-    struct Selected {VkPipeline pipeline{};std::uint64_t generation{};};
+    struct Selected {VkPipeline pipeline{};std::uint64_t generation{};std::array<char,64> sha256{};};
     std::array<Selected,shaderArchiveFullGraphSelectionLimit> selected;
     std::size_t selectedCount{};
     bool fullGraph{};
+    bool r8StorageOnly{};
     std::size_t moduleLimit()const noexcept {return fullGraph?shaderArchiveFullGraphModuleLimit:shaderArchiveModuleLimit;}
     std::size_t selectionLimit()const noexcept {return fullGraph?shaderArchiveFullGraphSelectionLimit:shaderArchiveSelectionLimit;}
     std::span<ArchivedCode> codeSlots() noexcept {return {codes.data(),moduleLimit()};}
@@ -346,11 +347,12 @@ struct ShaderArchive {
     }
 };
 
-ShaderArchive* createShaderArchive(VkDevice device,Sink sink,bool fullGraph) noexcept {
+ShaderArchive* createShaderArchive(VkDevice device,Sink sink,bool fullGraph,bool r8StorageOnly) noexcept {
     ErrorGuard error;
-    try {auto* c=new ShaderArchive;c->device=device;c->sink=sink;c->fullGraph=fullGraph;
+    try {auto owned=std::make_unique<ShaderArchive>();auto* c=owned.get();c->device=device;c->sink=sink;c->fullGraph=fullGraph;
+        c->r8StorageOnly=r8StorageOnly;
         try {std::ostringstream s;s.imbue(std::locale::classic());archiveBounds(s,c->fullGraph);c->emit(c->line("sr_shader_archive_start",s.str()));}catch(...){++c->failures;}
-        return c;
+        return owned.release();
     }catch(...){return nullptr;}
 }
 void shaderArchiveSummary(ShaderArchive* c) noexcept {
@@ -398,6 +400,15 @@ void archiveShader(ShaderArchive* c,VkShaderModule module,const VkShaderModuleCr
         }
         if(hash)BCryptDestroyHash(hash);if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);
         c->runtimeShaders.insert_or_assign(module,runtime);
+        if(c->r8StorageOnly){
+            bool r8Storage{};
+            // Capture candidates, not a proof of full writes: conditional/read-only users also qualify.
+            for(std::size_t n=5;n<words.size();){const auto count=words[n]>>16;
+                if(!count||count>words.size()-n)break;
+                if((words[n]&65535)==25&&count>=9&&words[n+7]==2&&words[n+8]==15){r8Storage=true;break;}
+                n+=count;}
+            if(!r8Storage)return;
+        }
         if(c->selectedCount==c->selectionLimit())return;
         if(c->retainedModules>=c->moduleLimit()){++c->moduleLimitRefused;return;}
         if(info->codeSize>shaderArchiveTotalBytes-c->retainedBytes){++c->byteLimitRefused;return;}
@@ -405,7 +416,7 @@ void archiveShader(ShaderArchive* c,VkShaderModule module,const VkShaderModuleCr
         for(const auto& binding:metadata.bindings)if(binding.set&&*binding.set==0&&binding.binding&&
             std::find(bindings.begin(),bindings.begin()+count,*binding.binding)==bindings.begin()+count)bindings[count++]=*binding.binding;
         const bool prepare=count==8&&std::all_of(bindings.begin(),bindings.begin()+8,[](auto b){return b<8;});
-        const bool retain=c->fullGraph?count!=0:count>=10||prepare;
+        const bool retain=c->r8StorageOnly||(c->fullGraph?count!=0:count>=10||prepare);
         if(!retain){++c->bindingFiltered;return;}
         auto& code=c->codes[c->retainedModules];code.words.assign(words.begin(),words.end());code.sha256=runtime.sha256;
         code.module=module;code.generation=generation;code.correlation=fingerprint(code.words.data(),code.words.size());code.set0Bindings=count;
@@ -544,11 +555,14 @@ void selectArchivedShader(ShaderArchive* c,VkPipeline pipeline,std::uint64_t gen
         for(std::size_t n=0;n<c->selectedCount;++n)
             if(c->selected[n].pipeline==pipeline&&c->selected[n].generation==generation)return;
         for(const auto& p:c->pipelines)if(p.handle==pipeline&&pipeline){selected=p;break;}
+        if(c->r8StorageOnly&&!selected.handle)return;
         if(!selected.handle)refusal="pipeline_not_recorded";
         else if(!generation||selected.generation!=generation)refusal="pipeline_generation_mismatch";
         else if(selected.codeIndex>=c->retainedModules)refusal="shader_candidate_not_retained";
         else if(!faultSink&&!c->sink)refusal="sink_unavailable";
-        else {code=&c->codes[selected.codeIndex];c->selected[c->selectedCount++]={pipeline,generation};}
+        else {code=&c->codes[selected.codeIndex];
+            if(c->r8StorageOnly)for(std::size_t n=0;n<c->selectedCount;++n)if(c->selected[n].sha256==code->sha256)return;
+            c->selected[c->selectedCount++]={pipeline,generation,code->sha256};}
         if(refusal){++c->selectionRefused;reportRefusal=!c->refusalReported;c->refusalReported=true;}
     }
         if(refusal&&!reportRefusal)return;

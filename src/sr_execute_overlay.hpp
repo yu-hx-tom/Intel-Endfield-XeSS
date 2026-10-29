@@ -4,6 +4,9 @@
 #include "xess_sr.hpp"
 #include "xess_sr_game_requirements.hpp"
 #include <array>
+#include <memory>
+
+namespace xess_vk::fsr4 {class Bridge;}
 
 namespace xess_vk::sr_overlay {
 enum class Enable { Off, On };
@@ -79,6 +82,7 @@ struct Frame {
     bool domainAndDownstreamVerified{},preExposureConventionVerified{},motionConventionVerified{};
     bool cameraHistoryVerified{},applicationReferencesRetained{},aliasCoverageComplete{},sourcesUnchangedAtUse{};
     bool nativeCoreReplaced{},wholeCoreTransactionVerified{},atAccumulateBoundary{};
+    float frameTimeMs=16.666667f,cameraNear=0.1f,cameraFar=10000.0f,cameraFov=1.04719755f;
 };
 struct SdkFunctions {
     sr_game::RequiredQueries requirements;
@@ -104,6 +108,13 @@ struct VulkanFunctions {
     void (*leaveInjectedRecording)(void*) noexcept{};
     void* user{};
     PFN_vkCmdBlitImage blit{};
+    PFN_vkGetInstanceProcAddr gipa{};
+    PFN_vkGetDeviceProcAddr gdpa{};
+    std::uint32_t queueFamily=VK_QUEUE_FAMILY_IGNORED;
+    const wchar_t* fsr4Directory{};
+    // Downstream GIPA requires the layer's physical handle, not the public
+    // loader-wrapped handle in RuntimeIdentity that the XeSS SDK consumes.
+    VkPhysicalDevice physicalForInstanceDispatch{};
 };
 // Only before any SDK commands were recorded: replace an omitted core's color
 // output after temporal/depth/restore admission refused. Never for SDK failures.
@@ -136,7 +147,7 @@ enum class Discard { Unknown, SuccessfulReset, FreeObserved, SuccessfulPoolReset
 // single, ordered graphics queue. No method adds a submission or wait.
 class Overlay {
 public:
-    Overlay()=default;
+    Overlay();
     ~Overlay();
     Overlay(const Overlay&)=delete;
     Overlay& operator=(const Overlay&)=delete;
@@ -152,6 +163,10 @@ public:
     Result record(const Frame&) noexcept;
     bool submitted(const Submission&) noexcept;
     bool completed(const Completion&) noexcept;
+    // FSR4 has its own exact tail-retirement fence. Its admitted CB is one-time;
+    // after full retirement, release the SR record and mapping without waiting
+    // for Unity to recycle that CB. No CPU wait or copy-only completion proof.
+    unsigned pollBackendCompletions() noexcept;
     bool discarded(RecordingKey,Discard) noexcept;
     bool retired(RecordingKey,Discard) noexcept;
     void poolRetired(std::uint64_t,Discard) noexcept;
@@ -162,10 +177,12 @@ public:
     State state()const noexcept{return state_;}
     bool pending()const noexcept;
     bool contains(RecordingKey)const noexcept;
-    bool hasContext()const noexcept{return context_!=nullptr;}
+    bool hasContext()const noexcept{return context_!=nullptr||(fsr4_&&state_!=State::Disabled);}
+    fsr4::Bridge* fsr4Bridge()const noexcept{return fsr4_.get();}
     xess_quality_settings_t requestedQuality()const noexcept{return requested_;}
     xess_quality_settings_t effectiveQuality()const noexcept{return effective_;}
     const char* lastSdkOperation()const noexcept{return sdkOperation_;}
+    const char* lastBackendError()const noexcept{return backendError_.c_str();}
 private:
     enum class SubmissionState { Recorded, FailedNotEnqueued, Submitted, DeviceLost, Unknown };
     struct Pending {
@@ -183,6 +200,8 @@ private:
     SdkFunctions sdk_;
     VulkanFunctions vk_;
     xess_context_handle_t context_{};
+    std::unique_ptr<fsr4::Bridge> fsr4_;
+    std::string backendError_;
     const char* sdkOperation_{"none"};
     Configuration config_,rejectedInput_;
     bool rejectedInputKnown_{};
@@ -191,6 +210,7 @@ private:
     bool resetRequired_{true};
     std::uint64_t attempts_{},lastFrame_{},historyEpoch_{};
     bool onInitialThread()const noexcept;
+    void backendError(const char* error)noexcept{try{backendError_=error;}catch(...){}}
     Status validate(const Frame&)const noexcept;
     void barriers(VkCommandBuffer,const Frame&,bool before)const noexcept;
     void restore(VkCommandBuffer,const ComputeRestore&)const noexcept;

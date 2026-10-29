@@ -19,6 +19,7 @@ $Override30Fps = $false
 $FrameCapTargetFps = 40
 $FgDebugMode = 0
 $FgSceneIndex = -1
+$SrBackend = 'XeSS'
 $fixedGameDirectory = Join-Path $root "out/path-fixture/launcher/games/Arknights Endfield"
 $fixedOfficialLauncherPath = Join-Path (Split-Path -Parent (Split-Path -Parent $fixedGameDirectory)) "Launcher.exe"
 function Read-GameDirectory { return $fixedGameDirectory }
@@ -31,19 +32,19 @@ function Refuses([scriptblock]$Action, [string]$Message) {
 # Load the three pure helpers, a process guard with a scoped fake process query,
 # and literal pins. Never execute management
 # Install, Launch, LaunchMod, Smoke, Uninstall, UAC or any child executable.
-foreach ($name in @('baseOwnedNames','modOwnedNames','legacySdkOwnedNames','sdkOwnedNames','sdkVersion','xeFGDllSha256','xellDllSha256','intelLicenseSha256','xessSrDllSha256','efuSha256','previousPreviewEfuSha256','previousDitherEfuSha256','legacyEfuSha256','legacyEfuSourceCommit','efuLicenseSha256','efuSourceCommit','officialLauncherPublisher','previousUnitySha256','layerName')) {
+foreach ($name in @('baseOwnedNames','modOwnedNames','legacySdkOwnedNames','sdkOwnedNames','fsr4OwnedNames','fsr4XmxDllSha256','fsr4OriginalDllSha256','sdkVersion','xeFGDllSha256','xellDllSha256','intelLicenseSha256','xessSrDllSha256','efuSha256','previousPreviewEfuSha256','previousDitherEfuSha256','legacyEfuSha256','legacyEfuSourceCommit','efuLicenseSha256','efuSourceCommit','officialLauncherPublisher','previousUnitySha256','layerName')) {
     $assignment = @($ast.EndBlock.Statements | Where-Object {
         $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.VariablePath.UserPath -eq $name
     })
     Check ($assignment.Count -eq 1) "Missing literal pin: $name"
     $literals = @($assignment[0].Right.FindAll({ param($node) $node -is [Management.Automation.Language.StringConstantExpressionAst] }, $true))
     Check ($literals.Count -gt 0) "Pin is no longer literal text: $name"
-    if ($name -in @('baseOwnedNames','modOwnedNames','legacySdkOwnedNames','sdkOwnedNames')) { Set-Variable -Name $name -Value @($literals | ForEach-Object Value) }
+    if ($name -in @('baseOwnedNames','modOwnedNames','legacySdkOwnedNames','sdkOwnedNames','fsr4OwnedNames')) { Set-Variable -Name $name -Value @($literals | ForEach-Object Value) }
     else { Check ($literals.Count -eq 1) "Unexpected pin expression: $name"; Set-Variable -Name $name -Value $literals[0].Value }
 }
 $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'EndfieldXeSSObserver'
 $efuPath = Join-Path $installRoot 'EFU.exe'
-foreach ($name in @('Get-ReceiptOwnedNames','Assert-SingleChainPolicy','Get-ModLaunchSpecification','Normalize-GameDirectory','Set-ObserverChildEnvironment','Set-OfficialCompatibilityEnvironment','Set-InputObservationEnvironment','Set-ContinuousOffEnvironment','Set-NoDitherEnvironment','Assert-OfficialLauncherIdentity','Get-ModGameCompatibility','Get-GameSignature','Test-GameSignature','Assert-NoReparse','Assert-PeDll','Get-TrustedPowerShell7')) {
+foreach ($name in @('Get-SdkFileMapping','Get-ReceiptOwnedNames','Assert-SingleChainPolicy','Get-ModLaunchSpecification','Normalize-GameDirectory','Set-ObserverChildEnvironment','Set-OfficialCompatibilityEnvironment','Set-InputObservationEnvironment','Set-ContinuousOffEnvironment','Set-NoDitherEnvironment','Assert-OfficialLauncherIdentity','Get-ModGameCompatibility','Get-GameSignature','Test-GameSignature','Assert-NoReparse','Assert-PeDll','Get-TrustedPowerShell7')) {
     $definition = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true))
     Check ($definition.Count -eq 1) "Missing pure helper: $name"
     . ([scriptblock]::Create($definition[0].Extent.Text))
@@ -160,6 +161,20 @@ $sdk = $mod | ConvertTo-Json -Depth 8 | ConvertFrom-Json @jsonOptions
 $sdk | Add-Member -NotePropertyName xeFGSdk -NotePropertyValue ([pscustomobject]@{version=1;sdkVersion=$sdkVersion;sourceHashes=$sdkHashes})
 foreach ($name in $sdkMapping.Keys) { $sdk.files += [pscustomobject]@{name=$name;sha256=$sdkHashes.($sdkMapping[$name])} }
 Check (@(Get-ReceiptOwnedNames $sdk).Count -eq 12) 'Reviewed 12-file SDK receipt rejected.'
+$fsr4Receipt=$sdk | ConvertTo-Json -Depth 10 | ConvertFrom-Json @jsonOptions
+foreach($pair in @(@('amd_fidelityfx_upscaler_dx12.dll','fsr4XmxDllSha256',$fsr4XmxDllSha256),@('fsr-original.dll','fsr4OriginalDllSha256',$fsr4OriginalDllSha256))){
+    $fsr4Receipt.xeFGSdk.sourceHashes | Add-Member -NotePropertyName $pair[1] -NotePropertyValue $pair[2]
+    $fsr4Receipt.files += [pscustomobject]@{name=$pair[0];sha256=$pair[2]}
+}
+Check (@(Get-ReceiptOwnedNames $fsr4Receipt).Count -eq 14) 'FSR4 optional two-file receipt rejected.'
+foreach($field in @('fsr4XmxDllSha256','fsr4OriginalDllSha256')){
+    $invalid=$fsr4Receipt | ConvertTo-Json -Depth 10 | ConvertFrom-Json @jsonOptions
+    $invalid.xeFGSdk.sourceHashes.$field=$dummyHash
+    Refuses { Get-ReceiptOwnedNames $invalid } "Unpinned FSR4 hash accepted: $field"
+}
+$invalid=$fsr4Receipt | ConvertTo-Json -Depth 10 | ConvertFrom-Json @jsonOptions
+$invalid.files=@($invalid.files | Where-Object name -cne 'fsr-original.dll')
+Refuses { Get-ReceiptOwnedNames $invalid } 'FSR4 receipt accepted without weights DLL.'
 foreach ($name in $sdkMapping.Keys) {
     $invalid = $sdk | ConvertTo-Json -Depth 8 | ConvertFrom-Json @jsonOptions
     ($invalid.files | Where-Object name -CEQ $name).sha256 = $dummyHash
@@ -838,6 +853,16 @@ foreach ($timingRequested in @($true,$false)) {
 }
 Set-ContinuousOffEnvironment $srChild 'C:\fixture-session' | Out-Null
 Check (-not $srChild.EnvironmentVariables.ContainsKey('XESS_SR_REPLACE')) 'A later normal launch must remove inherited SR opt-in.'
+Check (-not $srChild.EnvironmentVariables.ContainsKey('XESS_SR_BACKEND')) 'A normal launch inherited an SR backend.'
+& {
+    $SrBackend='Fsr4XmxLite';$XessSr=$true
+    $child=[Diagnostics.ProcessStartInfo]::new()
+    Set-ContinuousOffEnvironment $child 'C:\fixture-session' $false $false $false $true $false $false $true | Out-Null
+    Check ($child.EnvironmentVariables['XESS_SR_BACKEND'] -ceq 'fsr4_xmx_lite') 'FSR4 selected backend lost in child environment.'
+    Refuses { Set-ContinuousOffEnvironment $child 'C:\fixture-session' } 'FSR4 accepted without SR replacement.'
+    . ([scriptblock]::Create($parameterAssignment[0].Extent.Text))
+    Check ($parameters.SrBackend -ceq 'Fsr4XmxLite') 'Elevation lost the selected FSR4 backend.'
+}
 
 foreach($debugValue in 0..3){foreach($sceneValue in 0..6){foreach($capValue in @($false,$true)){
     & {$FgDebugMode=$debugValue;$FgSceneIndex=$sceneValue;$Override30Fps=$capValue

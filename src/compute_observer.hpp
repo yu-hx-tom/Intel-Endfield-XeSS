@@ -42,7 +42,9 @@ inline constexpr std::size_t shaderArchiveSpecializationMaps=128,shaderArchiveSp
 inline constexpr std::size_t shaderArchiveSetLayouts=2048,shaderArchivePipelineLayouts=1024,shaderArchiveLayoutBindings=64,shaderArchiveLayoutSets=8;
 inline constexpr std::size_t shaderArchivePushRanges=32,shaderArchiveImmutableSamplers=256,shaderArchiveLayoutTotalBytes=4*1024*1024;
 struct ShaderArchive;
-ShaderArchive* createShaderArchive(VkDevice,Sink,bool fullGraph=false) noexcept;
+// The diagnostic R8-storage filter only affects retained SPIR-V, never runtime
+// fingerprints/read facts or rendering admission. Unrelated modules consume no capture quota.
+ShaderArchive* createShaderArchive(VkDevice,Sink,bool fullGraph=false,bool r8StorageOnly=false) noexcept;
 void destroyShaderArchive(ShaderArchive*) noexcept;
 void shaderArchiveSummary(ShaderArchive*) noexcept;
 void archiveShader(ShaderArchive*,VkShaderModule,const VkShaderModuleCreateInfo*) noexcept;
